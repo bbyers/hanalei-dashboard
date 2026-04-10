@@ -658,14 +658,14 @@ function renderDashboard(d) {
       </div>
     </div>
 
-    <div class="alert-banner ${d.already_above ? 'alert-above' : d.alert ? (d.prob >= 0.5 ? 'alert-high' : 'alert-elevated') : 'alert-low'}" id="alert-banner">
+    <div class="alert-banner ${d.already_above ? 'alert-above' : d.prob >= 0.5 ? 'alert-high' : d.prob >= 0.15 ? 'alert-elevated' : 'alert-low'}" id="alert-banner">
       ${d.already_above
         ? '🚨 GAUGE IS ABOVE 5.0 FT — ROAD LIKELY CLOSED'
-        : d.alert
-          ? (d.prob >= 0.5
-            ? '⚠️ HIGH PROBABILITY of closure within 3 hours'
-            : '⚠️ ELEVATED PROBABILITY — monitor closely')
-          : '✅ Low probability of closure in next 3 hours'}
+        : d.prob >= 0.5
+          ? '⚠️ HIGH PROBABILITY of closure within 3 hours'
+          : d.prob >= 0.15
+            ? '⚠️ ELEVATED PROBABILITY — monitor closely'
+            : '✅ Low probability of closure in next 3 hours'}
     </div>
 
     <div class="cards">
