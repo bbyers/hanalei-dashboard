@@ -29,9 +29,12 @@ from hanalei_closure_model import (
     TrainBundle,
     build_features,
     fetch_all_rain_recent,
+    fetch_bridge_gauge_recent,
     fetch_discharge_recent,
     fetch_gauge_recent,
+    fetch_nasa_power_precip_recent,
     fetch_nws_forecast,
+    fetch_soil_moisture_recent,
     fetch_tide_recent,
     fetch_weather_recent,
     to_hourly,
@@ -88,8 +91,32 @@ def _run_prediction() -> dict:
     except Exception as e:
         _log(f"[predict] weather failed: {e}")
         wx = pd.DataFrame()
+    bridge_raw = None
+    try:
+        _log("[predict] fetching bridge gauge...")
+        bridge_raw = fetch_bridge_gauge_recent(hours=200)
+        _log(f"[predict] bridge gauge: {len(bridge_raw)} rows")
+    except Exception as e:
+        _log(f"[predict] bridge gauge failed: {e}")
+    soil = None
+    try:
+        _log("[predict] fetching soil moisture...")
+        soil = fetch_soil_moisture_recent(hours=200)
+        _log(f"[predict] soil moisture: {len(soil)} rows")
+    except Exception as e:
+        _log(f"[predict] soil moisture failed: {e}")
+    sat_precip = None
+    try:
+        _log("[predict] fetching satellite precip...")
+        sat_precip = fetch_nasa_power_precip_recent(days=14)
+        _log(f"[predict] sat precip: {len(sat_precip) if sat_precip is not None else 0} rows")
+    except Exception as e:
+        _log(f"[predict] satellite precip failed: {e}")
     _log("[predict] building hourly...")
-    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
+    hourly = to_hourly(
+        gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred,
+        nws=nws, weather=wx, bridge_raw=bridge_raw, soil_moisture=soil, sat_precip=sat_precip,
+    )
     # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
     for name in rain_raw:
@@ -101,10 +128,14 @@ def _run_prediction() -> dict:
         cutoff = last_rain_ts.floor("h")
         hourly = hourly.loc[hourly.index <= cutoff]
     _log(f"[predict] hourly rows: {len(hourly)}, cols: {list(hourly.columns)[:5]}...")
-    # NWS forecast columns may be NaN for most rows — exclude from dropna
-    # (HistGradientBoosting handles NaN natively)
-    NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
-    dropna_cols = [c for c in bundle.features if c not in NWS_ONLY]
+    # These features may legitimately be NaN — model handles NaN natively
+    NAN_OK = {"nws_qpf_3h", "nws_qpf_6h",
+              "bridge_ft", "bridge_lag_1", "bridge_lag_3", "bridge_lag_6",
+              "bridge_delta_1", "bridge_delta_3", "bridge_above_7ft", "bridge_gauge_diff",
+              "sat_precip_mm", "sat_precip_sum_3d", "sat_precip_sum_7d",
+              "soil_moisture_shallow", "soil_moisture_mid", "soil_moisture_deep",
+              "soil_moisture_delta_24", "rain_x_soil_moisture"}
+    dropna_cols = [c for c in bundle.features if c not in NAN_OK]
     _log(f"[predict] building features, dropna on {len(dropna_cols)} cols...")
     feats = build_features(hourly).dropna(subset=dropna_cols)
     _log(f"[predict] feats rows after dropna: {len(feats)}")
@@ -145,7 +176,7 @@ def _run_prediction() -> dict:
     _log("[predict] building history arrays...")
     # Gauge history for sparkline (last 48h)
     gauge_hist = []
-    last_48 = feats.tail(48)
+    last_48 = feats.tail(48 * 4)
     for ts, row in last_48.iterrows():
         gauge_hist.append({
             "ts": ts.isoformat(),
@@ -164,11 +195,11 @@ def _run_prediction() -> dict:
             entry["surge_ft"] = round(float(row["storm_surge_ft"]), 2)
         tide_hist.append(entry)
 
-    _log("[predict] computing prob history (48 rows)...")
+    _log("[predict] computing prob history (48h @ 15-min)...")
     # Probability history from feats (last 48h)
     prob_hist = []
     if len(feats) > 1:
-        recent_feats = feats.tail(48)
+        recent_feats = feats.tail(48 * 4)
         x_recent = recent_feats[bundle.features].values
         probs_recent = bundle.model.predict_proba(x_recent)[:, 1]
         if calibrator is not None:
