@@ -883,5 +883,22 @@ def main():
     app.run(host=args.host, port=args.port, debug=False)
 
 
+def _init_app():
+    """Initialize model and background thread for both gunicorn and direct run."""
+    global _bundle
+    model_path = os.environ.get("MODEL_PATH", "./model.joblib")
+    if _bundle is None and Path(model_path).exists():
+        _bundle = joblib.load(model_path)
+        print(f"Loaded model: horizon={_bundle.horizon_h}h, threshold={_bundle.threshold:.4f}, "
+              f"features={len(_bundle.features)}")
+        t = threading.Thread(target=_prediction_loop, daemon=True)
+        t.start()
+        print(f"Background predictor started (refreshes every {_REFRESH_SECONDS}s)")
+
+
+# Auto-init when imported by gunicorn
+_init_app()
+
+
 if __name__ == "__main__":
     main()
