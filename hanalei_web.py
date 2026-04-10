@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 import traceback
@@ -63,8 +64,16 @@ def _run_prediction() -> dict:
     q_raw = fetch_discharge_recent(hours=200)
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
-    nws = fetch_nws_forecast()
-    wx = fetch_weather_recent(hours=200)
+    try:
+        nws = fetch_nws_forecast()
+    except Exception as e:
+        print(f"  NWS forecast failed: {e}", file=sys.stderr)
+        nws = None
+    try:
+        wx = fetch_weather_recent(hours=200)
+    except Exception as e:
+        print(f"  Weather recent failed: {e}", file=sys.stderr)
+        wx = pd.DataFrame()
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
     # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
@@ -189,6 +198,9 @@ def _do_fetch():
                 })
                 _history = _history[-864:]
     except Exception as e:
+        print(f"PREDICTION ERROR: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         with _lock:
             _latest = {"status": "error", "message": str(e), "trace": traceback.format_exc()}
             _fetching = False
@@ -211,6 +223,18 @@ def _prediction_loop():
 def api_predict():
     with _lock:
         return jsonify({**_latest, "fetching": _fetching})
+
+
+@app.route("/api/debug")
+def api_debug():
+    with _lock:
+        return jsonify({
+            "status": _latest.get("status"),
+            "fetching": _fetching,
+            "message": _latest.get("message"),
+            "trace": _latest.get("trace"),
+            "has_data": "prob" in _latest,
+        })
 
 
 @app.route("/api/refresh", methods=["POST"])
