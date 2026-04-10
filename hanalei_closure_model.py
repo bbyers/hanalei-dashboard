@@ -931,7 +931,10 @@ def predict_cmd(args):
     if last_rain_ts is not None and not hourly.empty:
         cutoff = last_rain_ts.floor("h")
         hourly = hourly.loc[hourly.index <= cutoff]
-    feats = build_features(hourly).dropna(subset=bundle.features)
+    # NWS forecast columns may be NaN — exclude from dropna (model handles NaN natively)
+    NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
+    dropna_cols = [c for c in bundle.features if c not in NWS_ONLY]
+    feats = build_features(hourly).dropna(subset=dropna_cols)
     if feats.empty:
         print(json.dumps({"error": "insufficient recent data"}))
         return

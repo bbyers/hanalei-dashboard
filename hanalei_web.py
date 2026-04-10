@@ -66,7 +66,11 @@ def _run_prediction() -> dict:
     nws = fetch_nws_forecast()
     wx = fetch_weather_recent(hours=200)
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
-    feats = build_features(hourly).dropna(subset=bundle.features)
+    # NWS forecast columns may be NaN for most rows — exclude from dropna
+    # (HistGradientBoosting handles NaN natively)
+    NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
+    dropna_cols = [c for c in bundle.features if c not in NWS_ONLY]
+    feats = build_features(hourly).dropna(subset=dropna_cols)
 
     if feats.empty:
         return {"status": "error", "message": "Insufficient recent data from USGS/NOAA"}
