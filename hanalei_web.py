@@ -63,11 +63,18 @@ def _run_prediction() -> dict:
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
-    # Drop the last row if it's an incomplete hourly bucket (current hour not yet finished).
-    # This prevents rain_sum_1 from reading 0 for the current partial hour.
-    now_utc = datetime.now(timezone.utc)
-    if not hourly.empty and hourly.index[-1].hour == now_utc.hour:
-        hourly = hourly.iloc[:-1]
+    # Find the last hour with *actual* rain observations (not fillna zeros).
+    # USGS data lags 1-2 hours, so trailing hourly buckets have 0 rain from fillna.
+    last_rain_ts = None
+    for name in rain_raw:
+        if not rain_raw[name].empty:
+            ts = rain_raw[name].index[-1]
+            if last_rain_ts is None or ts > last_rain_ts:
+                last_rain_ts = ts
+    if last_rain_ts is not None and not hourly.empty:
+        # Keep only hours up to and including the hour of the last rain reading
+        cutoff = last_rain_ts.floor("h")
+        hourly = hourly.loc[hourly.index <= cutoff]
     feats = build_features(hourly).dropna(subset=bundle.features)
 
     if feats.empty:
