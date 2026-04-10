@@ -134,6 +134,7 @@ def _run_prediction() -> dict:
         if col in latest.columns:
             rain_1h[name] = round(float(latest[col].iloc[0]), 2)
 
+    _log("[predict] building history arrays...")
     # Gauge history for sparkline (last 48h)
     gauge_hist = []
     last_48 = feats.tail(48)
@@ -147,14 +148,15 @@ def _run_prediction() -> dict:
     tide_hist = []
     for ts, row in last_48.iterrows():
         entry = {"ts": ts.isoformat()}
-        if "tide_ft" in row and not pd.isna(row["tide_ft"]):
+        if "tide_ft" in row.index and not pd.isna(row["tide_ft"]):
             entry["tide_ft"] = round(float(row["tide_ft"]), 2)
-        if "tide_pred_ft" in row and not pd.isna(row["tide_pred_ft"]):
+        if "tide_pred_ft" in row.index and not pd.isna(row["tide_pred_ft"]):
             entry["tide_pred_ft"] = round(float(row["tide_pred_ft"]), 2)
-        if "storm_surge_ft" in row and not pd.isna(row["storm_surge_ft"]):
+        if "storm_surge_ft" in row.index and not pd.isna(row["storm_surge_ft"]):
             entry["surge_ft"] = round(float(row["storm_surge_ft"]), 2)
         tide_hist.append(entry)
 
+    _log("[predict] computing prob history (48 rows)...")
     # Probability history from feats (last 48h)
     prob_hist = []
     if len(feats) > 1:
@@ -177,6 +179,7 @@ def _run_prediction() -> dict:
     ts_utc = latest.index[-1]
     ts_hst = ts_utc - timedelta(hours=10)
 
+    _log(f"[predict] returning result — status=ok, gauge={gauge_now:.2f}, prob={prob:.4f}")
     return {
         "status": "ok",
         "timestamp_utc": ts_utc.isoformat(),
@@ -208,6 +211,7 @@ def _do_fetch():
         _fetching = True
     try:
         result = _run_prediction()
+        _log(f"[fetch] prediction returned status={result.get('status')}")
         with _lock:
             _latest = result
             _fetching = False
@@ -988,9 +992,20 @@ function scheduleAutoRefresh() {
   }, AUTO_REFRESH_MS);
 }
 
-// Initial load: fetch cached data, then start auto-refresh cycle
-fetchAndRender();
-scheduleAutoRefresh();
+// Initial load: poll every 3s until data is ready, then switch to 5min auto-refresh
+async function initialPoll() {
+  const resp = await fetch('/api/predict');
+  const d = await resp.json();
+  if (d.status === 'ok') {
+    renderDashboard(d);
+    updateTimestamp(d);
+    scheduleAutoRefresh();
+  } else {
+    updateTimestamp(d);
+    setTimeout(initialPoll, 3000);
+  }
+}
+initialPoll();
 </script>
 </body>
 </html>
