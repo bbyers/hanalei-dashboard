@@ -682,6 +682,10 @@ def predict_cmd(args):
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
+    # Drop incomplete current-hour bucket so rain_sum_1 isn't artificially 0
+    now_utc = datetime.now(timezone.utc)
+    if not hourly.empty and hourly.index[-1].hour == now_utc.hour:
+        hourly = hourly.iloc[:-1]
     feats = build_features(hourly).dropna(subset=bundle.features)
     if feats.empty:
         print(json.dumps({"error": "insufficient recent data"}))

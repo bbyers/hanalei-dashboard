@@ -63,6 +63,11 @@ def _run_prediction() -> dict:
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
+    # Drop the last row if it's an incomplete hourly bucket (current hour not yet finished).
+    # This prevents rain_sum_1 from reading 0 for the current partial hour.
+    now_utc = datetime.now(timezone.utc)
+    if not hourly.empty and hourly.index[-1].hour == now_utc.hour:
+        hourly = hourly.iloc[:-1]
     feats = build_features(hourly).dropna(subset=bundle.features)
 
     if feats.empty:
