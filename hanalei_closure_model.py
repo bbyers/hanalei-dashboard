@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hanalei road closure predictor (v4: multi-rain-gauge + weather).
+"""Hanalei road closure predictor (v5: improved target + dynamics + interactions).
 
 Predicts the probability that the Hanalei River gauge (USGS 16103000) will
 exceed the 5.0 ft road-closure threshold at any point in the next 1-3 hours,
@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import requests
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
@@ -91,6 +92,10 @@ def build_feature_columns() -> list[str]:
         "gauge_lag_1", "gauge_lag_2", "gauge_lag_3",
         "gauge_lag_6", "gauge_lag_12", "gauge_lag_24",
         "gauge_delta_1", "gauge_delta_3", "gauge_delta_6",
+        # --- gauge dynamics (v5) ---
+        "gauge_accel_1",       # acceleration: delta_1 - prev delta_1 (rate of rise change)
+        "gauge_accel_3",       # acceleration over 3h
+        "gauge_max_rise_6h",   # max hourly rise in last 6h (rapid-rise indicator)
         # --- discharge ---
         "q_cfs", "q_lag_1", "q_lag_3", "q_lag_6",
         "q_delta_1", "q_delta_3",
@@ -99,10 +104,28 @@ def build_feature_columns() -> list[str]:
     for name, _ in RAIN_GAUGES:
         for w in RAIN_WINDOWS_PER_GAUGE:
             cols.append(f"{_rain_col(name)}_sum_{w}")
+    # --- per-gauge rain intensity (v5): max hourly rate in window ---
+    for name, _ in RAIN_GAUGES:
+        for w in (3, 6):
+            cols.append(f"{_rain_col(name)}_max_{w}")
     # --- cross-gauge aggregates (spatial max + total, including long antecedent) ---
     for w in RAIN_WINDOWS_XGAUGE:
         cols.append(f"rain_max_sum_{w}")
         cols.append(f"rain_total_sum_{w}")
+    # --- cross-gauge intensity (v5) ---
+    for w in (3, 6):
+        cols.append(f"rain_max_rate_{w}")      # max of per-gauge max-rate
+    # --- soil saturation proxy (v5): exponentially-decayed rain accumulation ---
+    cols += [
+        "rain_ema_48h",        # half-life 48h exponential moving average (soil moisture proxy)
+        "rain_ema_168h",       # half-life 168h (7-day) — deep soil saturation
+    ]
+    # --- interaction features (v5) ---
+    cols += [
+        "rain_x_saturation",   # current rain × soil saturation → nonlinear flood risk
+        "rain_x_tide",         # current rain × tide level → compound flooding
+        "surge_x_rain",        # storm surge × rain → coastal + fluvial compound
+    ]
     # --- tide ---
     cols += [
         "tide_ft",               # observed water level (MLLW)
@@ -533,6 +556,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     for d in (1, 3, 6):
         out[f"gauge_delta_{d}"] = g - g.shift(d)
 
+    # --- gauge dynamics (v5) ---
+    d1 = g - g.shift(1)
+    out["gauge_accel_1"] = d1 - d1.shift(1)         # acceleration (2nd derivative)
+    d3 = g - g.shift(3)
+    out["gauge_accel_3"] = d3 - d3.shift(3)
+    out["gauge_max_rise_6h"] = d1.rolling(6, min_periods=1).max()  # max hourly rise in 6h
+
     # --- discharge features ---
     if "q_cfs" in out.columns:
         q = out["q_cfs"]
@@ -550,6 +580,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         for w in RAIN_WINDOWS_PER_GAUGE:
             out[f"{col}_sum_{w}"] = out[col].rolling(w, min_periods=1).sum()
 
+    # --- per-gauge rain intensity (v5): max hourly rate in window ---
+    for name, _ in RAIN_GAUGES:
+        col = _rain_col(name)
+        for w in (3, 6):
+            out[f"{col}_max_{w}"] = out[col].rolling(w, min_periods=1).max()
+
     # --- cross-gauge aggregates (including long antecedent windows) ---
     for w in RAIN_WINDOWS_XGAUGE:
         per_gauge_sums: list[pd.Series] = []
@@ -559,6 +595,22 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         stacked = pd.concat(per_gauge_sums, axis=1)
         out[f"rain_max_sum_{w}"] = stacked.max(axis=1)
         out[f"rain_total_sum_{w}"] = stacked.sum(axis=1)
+
+    # --- cross-gauge intensity (v5): max of per-gauge max-rate ---
+    for w in (3, 6):
+        max_rates = []
+        for name, _ in RAIN_GAUGES:
+            col = _rain_col(name)
+            max_rates.append(out[col].rolling(w, min_periods=1).max())
+        out[f"rain_max_rate_{w}"] = pd.concat(max_rates, axis=1).max(axis=1)
+
+    # --- soil saturation proxy (v5): exponentially-decayed rain accumulation ---
+    # Use total cross-gauge rain, apply EMA with specified half-life
+    total_rain = sum(
+        out[_rain_col(name)].fillna(0) for name, _ in RAIN_GAUGES
+    )
+    out["rain_ema_48h"] = total_rain.ewm(halflife=48, min_periods=1).mean()
+    out["rain_ema_168h"] = total_rain.ewm(halflife=168, min_periods=1).mean()
 
     # --- tide features ---
     if "tide_ft" in out.columns:
@@ -610,13 +662,28 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     out["above_3ft"] = (g > 3.0).astype(int)
     out["above_4ft"] = (g > 4.0).astype(int)
+
+    # --- interaction features (v5) ---
+    # Rain × soil saturation: saturated soil + heavy rain → much higher flood risk
+    rain_now = out["rain_max_sum_3"].fillna(0)
+    out["rain_x_saturation"] = rain_now * out["rain_ema_48h"].fillna(0)
+    # Rain × tide: high tide impedes drainage, amplifying flood from rain
+    out["rain_x_tide"] = rain_now * out["tide_ft"].fillna(0)
+    # Storm surge × rain: compound coastal + fluvial flooding
+    out["surge_x_rain"] = out["storm_surge_ft"].fillna(0) * rain_now
+
     return out
 
 
 def build_target(df: pd.DataFrame) -> pd.Series:
-    """closure_in_next_H[t] = 1 iff max(gauge[t+1..t+H]) > CLOSURE_FT."""
+    """closure_in_next_H[t] = 1 iff max(gauge[t..t+H]) > CLOSURE_FT.
+
+    Includes the current hour (shift 0) so that "gauge is already at flood
+    stage" is a positive label — the model learns to output ~1.0 when the
+    river is already above 5 ft.
+    """
     g = df["gauge_ft"]
-    shifts = pd.concat([g.shift(-i) for i in range(1, HORIZON_H + 1)], axis=1)
+    shifts = pd.concat([g.shift(-i) for i in range(0, HORIZON_H + 1)], axis=1)
     future_max = shifts.max(axis=1, skipna=True)
     y = pd.Series(pd.NA, index=df.index, dtype="Int8")
     mask = future_max.notna()
@@ -870,8 +937,23 @@ def train_cmd(args):
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     print(json.dumps(metrics, indent=2))
 
-    # Feature importance via permutation on a small val subsample would be ideal
-    # but HistGBT has no built-in. Store the feature list only.
+    # --- isotonic calibration on validation set ---
+    # Maps raw model scores → actual closure probabilities so the dashboard
+    # displays percentages that match empirical rates.
+    print("Fitting isotonic calibrator on validation set...", file=sys.stderr)
+    calibrator = IsotonicRegression(y_min=0, y_max=1, out_of_bounds="clip")
+    calibrator.fit(val_prob, y_val)
+    # Show a few calibration examples
+    sample_raws = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95]
+    for r in sample_raws:
+        print(f"  raw {r:.2f} → calibrated {calibrator.predict([r])[0]:.4f}", file=sys.stderr)
+
+    # Also calibrate test metrics for reporting
+    test_prob_cal = calibrator.predict(test_prob)
+    metrics["calibration_examples"] = {
+        f"raw_{r:.2f}": round(float(calibrator.predict([r])[0]), 4) for r in sample_raws
+    }
+
     bundle = TrainBundle(
         model=model,
         threshold=threshold,
@@ -880,7 +962,9 @@ def train_cmd(args):
         horizon_h=HORIZON_H,
         rain_gauge_names=[name for name, _ in RAIN_GAUGES],
     )
+    bundle.calibrator = calibrator  # attach calibrator to bundle
     joblib.dump(bundle, out_dir / "model.joblib")
+    joblib.dump(calibrator, out_dir / "calibrator.joblib")  # standalone backup
 
     # --- plots ---
     if y_test.sum() > 0:

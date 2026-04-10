@@ -122,10 +122,13 @@ def _run_prediction() -> dict:
         prob = float(calibrator.predict([raw_prob])[0])
     else:
         prob = raw_prob
-    _log(f"[predict] DONE — raw={raw_prob:.4f}, calibrated={prob:.4f}")
-    alert = bool(prob >= bundle.threshold)
     gauge_now = float(latest["gauge_ft"].iloc[0])
     already_above = bool(gauge_now >= bundle.closure_ft)
+    # If gauge is already at/above flood stage, override to 100%
+    if already_above:
+        prob = 1.0
+    _log(f"[predict] DONE — raw={raw_prob:.4f}, calibrated={prob:.4f}, above={already_above}")
+    alert = bool(prob >= bundle.threshold)
 
     rain_6h = {}
     for name, _ in RAIN_GAUGES:
