@@ -979,6 +979,20 @@ scheduleAutoRefresh();
 # CLI
 # ---------------------------------------------------------------------------
 
+def _init_model_and_thread(model_path: str):
+    """Load the model and start the background prediction thread."""
+    global _bundle
+    print(f"Loading model from {model_path}...", file=sys.stderr, flush=True)
+    _bundle = joblib.load(model_path)
+    print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
+          f"features: {len(_bundle.features)}", file=sys.stderr, flush=True)
+
+    t = threading.Thread(target=_prediction_loop, daemon=True)
+    t.start()
+    print(f"Background predictor started (refreshes every {_REFRESH_SECONDS}s)",
+          file=sys.stderr, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard")
     parser.add_argument("--model", default="./hanalei_v3_out/model.joblib",
@@ -987,20 +1001,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
-    global _bundle
-    print(f"Loading model from {args.model}...")
-    _bundle = joblib.load(args.model)
-    print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
-          f"features: {len(_bundle.features)}")
-
-    # Start background prediction thread
-    t = threading.Thread(target=_prediction_loop, daemon=True)
-    t.start()
-    print(f"Background predictor started (refreshes every {_REFRESH_SECONDS}s)")
-
+    _init_model_and_thread(args.model)
     print(f"\n  Dashboard: http://{args.host}:{args.port}\n")
     app.run(host=args.host, port=args.port, debug=False)
 
+
+# --- Auto-init when imported by gunicorn (where __name__ != "__main__") ---
+if _bundle is None and __name__ != "__main__":
+    for _p in ["model.joblib", "./model.joblib"]:
+        if Path(_p).exists():
+            _init_model_and_thread(_p)
+            break
 
 if __name__ == "__main__":
     main()
