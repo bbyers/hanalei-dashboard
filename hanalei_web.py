@@ -670,7 +670,7 @@ HTML_TEMPLATE = r"""
 </div>
 
 <div class="footer">
-  Model: HistGradientBoosting &middot; 77 features &middot; 18.5 yr training set<br>
+  Model: HistGradientBoosting &middot; 115 features &middot; 18.5 yr training set &middot; 15-min resolution<br>
   Data: <a href="https://waterdata.usgs.gov/nwis/uv?site_no=16103000" target="_blank">USGS 16103000</a> &middot;
   <a href="https://tidesandcurrents.noaa.gov/stationhome.html?id=1611400" target="_blank">NOAA Nawiliwili</a><br>
   Not an official warning system
@@ -1072,6 +1072,10 @@ def _init_model_and_thread(model_path: str):
     """Load the model and start the background prediction thread."""
     global _bundle
     print(f"Loading model from {model_path}...", file=sys.stderr, flush=True)
+    # Fix pickle: model was saved when hanalei_closure_model was __main__,
+    # so pickle looks for TrainBundle in __main__. Register it there.
+    import __main__
+    __main__.TrainBundle = TrainBundle
     _bundle = joblib.load(model_path)
     print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
           f"features: {len(_bundle.features)}", file=sys.stderr, flush=True)
