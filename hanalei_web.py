@@ -23,23 +23,29 @@ import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, render_template_string
 
-# Import model components
-from hanalei_closure_model import (
-    RAIN_GAUGES,
-    TrainBundle,
-    build_features,
-    fetch_all_rain_recent,
-    fetch_bridge_gauge_recent,
-    fetch_discharge_recent,
-    fetch_gauge_recent,
-    fetch_nasa_power_precip_recent,
-    fetch_nws_forecast,
-    fetch_soil_moisture_recent,
-    fetch_tide_recent,
-    fetch_weather_recent,
-    to_hourly,
-    _rain_col,
-)
+print("[startup] importing hanalei_closure_model...", file=sys.stderr, flush=True)
+try:
+    from hanalei_closure_model import (
+        RAIN_GAUGES,
+        TrainBundle,
+        build_features,
+        fetch_all_rain_recent,
+        fetch_bridge_gauge_recent,
+        fetch_discharge_recent,
+        fetch_gauge_recent,
+        fetch_nasa_power_precip_recent,
+        fetch_nws_forecast,
+        fetch_soil_moisture_recent,
+        fetch_tide_recent,
+        fetch_weather_recent,
+        to_hourly,
+        _rain_col,
+    )
+    print("[startup] import OK", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[startup] IMPORT FAILED: {e}", file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+    raise
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -300,6 +306,12 @@ def api_debug():
             "message": _latest.get("message"),
             "trace": _latest.get("trace"),
             "has_data": "prob" in _latest,
+            "initialized": _initialized,
+            "init_error": _init_error,
+            "bundle_loaded": _bundle is not None,
+            "bundle_features": len(_bundle.features) if _bundle else None,
+            "cwd": str(Path.cwd()),
+            "model_exists": Path("model.joblib").exists(),
         })
 
 
@@ -1085,19 +1097,32 @@ def main():
 
 # --- Lazy init for gunicorn: threads don't survive fork, so start on first request ---
 _initialized = False
+_init_error = None
 
 @app.before_request
 def _lazy_init():
-    global _initialized
+    global _initialized, _init_error, _latest
     if not _initialized:
-        _initialized = True
         for _p in ["model.joblib", "./model.joblib"]:
             if Path(_p).exists():
-                _log(f"[init] lazy init from {_p} (worker pid={__import__('os').getpid()})")
-                _init_model_and_thread(_p)
-                break
-        else:
-            _log("[init] ERROR: model.joblib not found!")
+                try:
+                    _log(f"[init] lazy init from {_p} (worker pid={__import__('os').getpid()})")
+                    _init_model_and_thread(_p)
+                    _initialized = True
+                    _init_error = None
+                    _log("[init] SUCCESS — model loaded, background thread started")
+                except Exception as e:
+                    _init_error = traceback.format_exc()
+                    _log(f"[init] FAILED: {e}")
+                    _log(_init_error)
+                    _latest = {"status": "error", "message": f"Model init failed: {e}",
+                               "trace": _init_error}
+                    _initialized = True  # don't retry every request — surface the error
+                return
+        _log("[init] ERROR: model.joblib not found!")
+        _init_error = "model.joblib not found"
+        _latest = {"status": "error", "message": "model.joblib not found"}
+        _initialized = True
 
 if __name__ == "__main__":
     main()

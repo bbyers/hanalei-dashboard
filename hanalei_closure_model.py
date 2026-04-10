@@ -22,9 +22,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import joblib
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None  # plotting not available (web deployment)
 import numpy as np
 import pandas as pd
 import requests
