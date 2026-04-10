@@ -66,6 +66,16 @@ def _run_prediction() -> dict:
     nws = fetch_nws_forecast()
     wx = fetch_weather_recent(hours=200)
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
+    # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
+    last_rain_ts = None
+    for name in rain_raw:
+        if not rain_raw[name].empty:
+            ts = rain_raw[name].index[-1]
+            if last_rain_ts is None or ts > last_rain_ts:
+                last_rain_ts = ts
+    if last_rain_ts is not None and not hourly.empty:
+        cutoff = last_rain_ts.floor("h")
+        hourly = hourly.loc[hourly.index <= cutoff]
     # NWS forecast columns may be NaN for most rows — exclude from dropna
     # (HistGradientBoosting handles NaN natively)
     NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
@@ -102,6 +112,18 @@ def _run_prediction() -> dict:
             "ts": ts.isoformat(),
             "gauge_ft": round(float(row["gauge_ft"]), 2),
         })
+
+    # Tide history (last 48h)
+    tide_hist = []
+    for ts, row in last_48.iterrows():
+        entry = {"ts": ts.isoformat()}
+        if "tide_ft" in row and not pd.isna(row["tide_ft"]):
+            entry["tide_ft"] = round(float(row["tide_ft"]), 2)
+        if "tide_pred_ft" in row and not pd.isna(row["tide_pred_ft"]):
+            entry["tide_pred_ft"] = round(float(row["tide_pred_ft"]), 2)
+        if "storm_surge_ft" in row and not pd.isna(row["storm_surge_ft"]):
+            entry["surge_ft"] = round(float(row["storm_surge_ft"]), 2)
+        tide_hist.append(entry)
 
     # Probability history from feats (last 48h)
     prob_hist = []
@@ -142,6 +164,7 @@ def _run_prediction() -> dict:
         "rain_1h": rain_1h,
         "rain_6h": rain_6h,
         "gauge_history": gauge_hist,
+        "tide_history": tide_hist,
         "prob_history": prob_hist,
         "horizon_h": bundle.horizon_h,
         "model_threshold_pct": round(bundle.threshold * 100, 1),
@@ -545,7 +568,7 @@ HTML_TEMPLATE = r"""
 </div>
 
 <div class="footer">
-  Model: HistGradientBoosting &middot; 66 features &middot; 18.5 yr training set<br>
+  Model: HistGradientBoosting &middot; 77 features &middot; 18.5 yr training set<br>
   Data: <a href="https://waterdata.usgs.gov/nwis/uv?site_no=16103000" target="_blank">USGS 16103000</a> &middot;
   <a href="https://tidesandcurrents.noaa.gov/stationhome.html?id=1611400" target="_blank">NOAA Nawiliwili</a><br>
   Not an official warning system
@@ -557,6 +580,7 @@ HTML_TEMPLATE = r"""
 const AUTO_REFRESH_MS = 5 * 60 * 1000;  // auto-refresh every 5 minutes
 let gaugeChart = null;
 let probChart = null;
+let tideChart = null;
 let nextRefreshTimer = null;
 let countdownInterval = null;
 let nextRefreshAt = null;
@@ -624,6 +648,10 @@ function renderDashboard(d) {
         <div style="position:relative; height:200px;"><canvas id="gaugeChart"></canvas></div>
       </div>
       <div class="chart-card">
+        <div class="chart-title">Tide Level — Last 48 Hours</div>
+        <div style="position:relative; height:200px;"><canvas id="tideChart"></canvas></div>
+      </div>
+      <div class="chart-card">
         <div class="chart-title">Rainfall by Gauge</div>
         <table class="rain-table">
           <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th></th></tr></thead>
@@ -675,6 +703,7 @@ function renderDashboard(d) {
   // Charts
   buildProbChart(d.prob_history || [], d.model_threshold_pct);
   buildGaugeChart(d.gauge_history || [], d.closure_ft);
+  buildTideChart(d.tide_history || []);
 }
 
 function buildProbChart(data, threshPct) {
@@ -767,6 +796,65 @@ function buildGaugeChart(data, closureFt) {
           max: maxG,
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', stepSize: 2, callback: v => v + ' ft', autoSkip: false },
+        }
+      },
+      interaction: { intersect: false, mode: 'index' },
+      responsive: true,
+      maintainAspectRatio: false,
+    }
+  });
+}
+
+function buildTideChart(data) {
+  const ctx = document.getElementById('tideChart');
+  if (!ctx) return;
+  if (tideChart) tideChart.destroy();
+  tideChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => new Date(d.ts)),
+      datasets: [{
+        label: 'Observed',
+        data: data.map(d => d.tide_ft ?? null),
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56,189,248,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2,
+      }, {
+        label: 'Predicted (astronomical)',
+        data: data.map(d => d.tide_pred_ft ?? null),
+        borderColor: 'rgba(148,163,184,0.6)',
+        borderDash: [4, 3],
+        pointRadius: 0,
+        borderWidth: 1.5,
+        fill: false,
+      }, {
+        label: 'Storm surge',
+        data: data.map(d => d.surge_ft ?? null),
+        borderColor: '#f97316',
+        backgroundColor: 'rgba(249,115,22,0.08)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 1.5,
+      }]
+    },
+    options: {
+      plugins: { legend: { display: true, labels: { color: '#8892a8', boxWidth: 12, padding: 8 } } },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+        },
+        y: {
+          min: -1,
+          max: 3,
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', stepSize: 1, callback: v => v + ' ft' },
         }
       },
       interaction: { intersect: false, mode: 'index' },
