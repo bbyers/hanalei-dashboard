@@ -1042,12 +1042,21 @@ def main():
     app.run(host=args.host, port=args.port, debug=False)
 
 
-# --- Auto-init when imported by gunicorn (where __name__ != "__main__") ---
-if _bundle is None and __name__ != "__main__":
-    for _p in ["model.joblib", "./model.joblib"]:
-        if Path(_p).exists():
-            _init_model_and_thread(_p)
-            break
+# --- Lazy init for gunicorn: threads don't survive fork, so start on first request ---
+_initialized = False
+
+@app.before_request
+def _lazy_init():
+    global _initialized
+    if not _initialized:
+        _initialized = True
+        for _p in ["model.joblib", "./model.joblib"]:
+            if Path(_p).exists():
+                _log(f"[init] lazy init from {_p} (worker pid={__import__('os').getpid()})")
+                _init_model_and_thread(_p)
+                break
+        else:
+            _log("[init] ERROR: model.joblib not found!")
 
 if __name__ == "__main__":
     main()
