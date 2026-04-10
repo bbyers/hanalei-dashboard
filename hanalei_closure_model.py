@@ -940,7 +940,9 @@ def predict_cmd(args):
         return
     latest = feats.iloc[[-1]]
     x = latest[bundle.features].values
-    prob = float(bundle.model.predict_proba(x)[0, 1])
+    raw_prob = float(bundle.model.predict_proba(x)[0, 1])
+    calibrator = getattr(bundle, "calibrator", None)
+    prob = float(calibrator.predict([raw_prob])[0]) if calibrator else raw_prob
     alert = bool(prob >= bundle.threshold)
     rain_totals_6h = {
         name: float(latest[f"{_rain_col(name)}_sum_6"].iloc[0])
