@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hanalei road closure predictor (v3: multi-rain-gauge).
+"""Hanalei road closure predictor (v4: multi-rain-gauge + weather).
 
 Predicts the probability that the Hanalei River gauge (USGS 16103000) will
 exceed the 5.0 ft road-closure threshold at any point in the next 1-3 hours,
@@ -59,8 +59,18 @@ RAIN_GAUGES: list[tuple[str, str]] = [
     ("n_wailua",    "220356159281401"),
 ]
 
+# NWS API forecast gridpoint for Hanalei, Kauai
+NWS_GRIDPOINT = "HFO/87,185"
+NWS_API_URL = f"https://api.weather.gov/gridpoints/{NWS_GRIDPOINT}"
+NWS_HEADERS = {"User-Agent": "hanalei-flood-model (research)", "Accept": "application/geo+json"}
+
 # Earliest date for which BOTH the stream gauge and all rain gauges have data.
 DATA_START = datetime(2007, 10, 1, tzinfo=timezone.utc)
+
+# Open-Meteo Historical Weather API (ERA5 reanalysis, free, no key needed).
+OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
+HANALEI_LAT = 22.198
+HANALEI_LON = -159.467
 
 CLOSURE_FT = 5.0
 HORIZON_H = 3
@@ -99,6 +109,23 @@ def build_feature_columns() -> list[str]:
         "tide_pred_ft",          # harmonic prediction (astronomical tide)
         "storm_surge_ft",        # observed - predicted (weather-driven anomaly)
         "tide_delta_3",          # tide change over 3h (rising vs falling)
+    ]
+    # --- atmospheric / weather (ERA5 historical for training, Open-Meteo + NWS for prediction) ---
+    cols += [
+        "wx_humidity_pct",       # relative humidity (%)
+        "wx_wind_kmh",           # wind speed (km/h)
+        "wx_wind_gust_kmh",     # wind gusts (km/h)
+        "wx_pressure_hpa",       # mean sea level pressure (hPa)
+        "wx_pressure_delta_3",   # pressure change over 3h (falling = storm)
+        "wx_pressure_delta_6",   # pressure change over 6h
+        "wx_precip_era5_mm",     # ERA5 gridded precip (mm) — coarse but available historically
+        "wx_precip_era5_sum_3",  # 3h rolling sum of ERA5 precip
+        "wx_precip_era5_sum_6",  # 6h rolling sum of ERA5 precip
+    ]
+    # --- NWS forecast-only (available at prediction time; NaN during training) ---
+    cols += [
+        "nws_qpf_3h",      # NWS forecast QPF next 3h (mm)
+        "nws_qpf_6h",      # NWS forecast QPF next 6h (mm)
     ]
     # --- time / indicator ---
     cols += [
@@ -201,8 +228,17 @@ def _fetch_noaa_tide(
         }
         if product == "predictions":
             params["interval"] = "6"  # 6-minute predictions to match observed cadence
-        r = requests.get(NOAA_COOPS_URL, params=params, timeout=120)
-        r.raise_for_status()
+        for attempt in range(3):
+            try:
+                r = requests.get(NOAA_COOPS_URL, params=params, timeout=120)
+                r.raise_for_status()
+                break
+            except (requests.exceptions.RequestException,) as exc:
+                if attempt < 2:
+                    print(f"    retry {attempt+1}/2 after {exc}", file=sys.stderr)
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise
         j = r.json()
         key = "predictions" if product == "predictions" else "data"
         records = j.get(key, [])
@@ -266,6 +302,153 @@ def fetch_tide_recent(hours: int = 200) -> tuple[pd.DataFrame, pd.DataFrame]:
     return fetch_tide_observed(start, end), fetch_tide_predicted(start, end)
 
 
+# --- Open-Meteo / ERA5 historical weather -----------------------------------
+
+def fetch_weather_era5(start: datetime, end: datetime) -> pd.DataFrame:
+    """Fetch ERA5 reanalysis weather data from Open-Meteo (free, no key).
+
+    Returns hourly DataFrame with columns:
+      wx_humidity_pct, wx_wind_kmh, wx_wind_gust_kmh, wx_pressure_hpa, wx_precip_era5_mm
+    """
+    print(f"  era5/weather   {start.date()} -> {end.date()}", file=sys.stderr)
+    params = {
+        "latitude": HANALEI_LAT,
+        "longitude": HANALEI_LON,
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+        "hourly": "precipitation,relative_humidity_2m,wind_speed_10m,pressure_msl,wind_gusts_10m",
+        "timezone": "UTC",
+    }
+    r = requests.get(OPEN_METEO_URL, params=params, timeout=120)
+    r.raise_for_status()
+    hourly = r.json().get("hourly", {})
+    df = pd.DataFrame({
+        "ts": pd.to_datetime(hourly["time"], utc=True),
+        "wx_humidity_pct": hourly.get("relative_humidity_2m"),
+        "wx_wind_kmh": hourly.get("wind_speed_10m"),
+        "wx_wind_gust_kmh": hourly.get("wind_gusts_10m"),
+        "wx_pressure_hpa": hourly.get("pressure_msl"),
+        "wx_precip_era5_mm": hourly.get("precipitation"),
+    })
+    df = df.set_index("ts")
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    print(f"  era5/weather   {len(df):,} hourly rows", file=sys.stderr)
+    return df
+
+
+def fetch_weather_recent(hours: int = 200) -> pd.DataFrame:
+    """Fetch recent weather from Open-Meteo forecast API (includes past days + forecast)."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+    print(f"  weather/recent {start.date()} -> {now.date()}", file=sys.stderr)
+    params = {
+        "latitude": HANALEI_LAT,
+        "longitude": HANALEI_LON,
+        "hourly": "precipitation,relative_humidity_2m,wind_speed_10m,pressure_msl,wind_gusts_10m",
+        "past_days": max(1, (now - start).days + 1),
+        "timezone": "UTC",
+    }
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=60)
+        r.raise_for_status()
+        hourly = r.json().get("hourly", {})
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(hourly["time"], utc=True),
+            "wx_humidity_pct": hourly.get("relative_humidity_2m"),
+            "wx_wind_kmh": hourly.get("wind_speed_10m"),
+            "wx_wind_gust_kmh": hourly.get("wind_gusts_10m"),
+            "wx_pressure_hpa": hourly.get("pressure_msl"),
+            "wx_precip_era5_mm": hourly.get("precipitation"),
+        })
+        df = df.set_index("ts")
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Trim to requested window
+        df = df.loc[df.index >= start]
+        print(f"  weather/recent {len(df):,} hourly rows", file=sys.stderr)
+        return df
+    except Exception as e:
+        print(f"  weather/recent FAILED: {e}", file=sys.stderr)
+        return pd.DataFrame()
+
+
+# --- NWS forecast data -----------------------------------------------------
+
+def _parse_nws_timeseries(values: list[dict], col_name: str) -> pd.DataFrame:
+    """Parse NWS ISO 8601 duration-based time series into a regular hourly DataFrame."""
+    records = []
+    for entry in values:
+        valid_time = entry.get("validTime", "")
+        value = entry.get("value")
+        if value is None or "/" not in valid_time:
+            continue
+        ts_str, duration = valid_time.split("/")
+        start = pd.Timestamp(ts_str)
+        # Parse ISO 8601 duration (e.g., PT1H, PT6H, PT4H)
+        hours = 0
+        dur = duration.replace("PT", "")
+        if "H" in dur:
+            hours = int(dur.replace("H", ""))
+        elif "D" in dur:
+            hours = int(dur.replace("D", "")) * 24
+        if hours == 0:
+            hours = 1
+        # Spread the value evenly across the duration (for QPF, value is total mm)
+        for h in range(hours):
+            records.append({"ts": start + timedelta(hours=h), col_name: float(value) / hours})
+    if not records:
+        return pd.DataFrame(columns=[col_name]).set_index(
+            pd.DatetimeIndex([], tz="UTC", name="ts")
+        )
+    df = pd.DataFrame(records)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df.drop_duplicates("ts").sort_values("ts").set_index("ts")
+
+
+def fetch_nws_forecast() -> dict[str, pd.DataFrame]:
+    """Fetch current NWS gridpoint forecast for Hanalei.
+
+    Returns dict with keys: 'qpf_mm', 'wind_kmh', 'humidity_pct', 'pressure_pa'.
+    Each is a DataFrame indexed by UTC timestamp at hourly resolution.
+    Returns empty DataFrames on failure (graceful degradation).
+    """
+    result = {}
+    try:
+        print("  nws/forecast  fetching...", file=sys.stderr)
+        r = requests.get(NWS_API_URL, headers=NWS_HEADERS, timeout=30)
+        r.raise_for_status()
+        props = r.json().get("properties", {})
+
+        # QPF — mm of precipitation per period
+        qpf = props.get("quantitativePrecipitation", {}).get("values", [])
+        result["qpf_mm"] = _parse_nws_timeseries(qpf, "qpf_mm")
+
+        # Wind speed — km/h
+        wind = props.get("windSpeed", {}).get("values", [])
+        result["wind_kmh"] = _parse_nws_timeseries(wind, "wind_kmh")
+
+        # Relative humidity — %
+        rh = props.get("relativeHumidity", {}).get("values", [])
+        result["humidity_pct"] = _parse_nws_timeseries(rh, "humidity_pct")
+
+        # Barometric pressure — Pa
+        pressure = props.get("pressure", {}).get("values", [])
+        result["pressure_pa"] = _parse_nws_timeseries(pressure, "pressure_pa")
+
+        for k, df in result.items():
+            print(f"  nws/{k:<14s} {len(df)} hourly values", file=sys.stderr)
+
+    except Exception as e:
+        print(f"  nws/forecast  FAILED: {e}", file=sys.stderr)
+        for col in ("qpf_mm", "wind_kmh", "humidity_pct", "pressure_pa"):
+            result[col] = pd.DataFrame(columns=[col]).set_index(
+                pd.DatetimeIndex([], tz="UTC", name="ts")
+            )
+
+    return result
+
+
 # --- merging / resampling --------------------------------------------------
 
 def to_hourly(
@@ -274,6 +457,8 @@ def to_hourly(
     q_raw: pd.DataFrame | None = None,
     tide_obs: pd.DataFrame | None = None,
     tide_pred: pd.DataFrame | None = None,
+    nws: dict[str, pd.DataFrame] | None = None,
+    weather: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Resample all sources to aligned hourly records.
 
@@ -282,6 +467,8 @@ def to_hourly(
     - rain:     hourly SUM of 15-min interval totals (inches)
     - tide_ft:  hourly MEAN of 6-min observed water level
     - tide_pred_ft: hourly MEAN of 6-min harmonic prediction
+    - wx_*:     hourly ERA5 weather variables (already hourly)
+    - nws_*:    hourly NWS forecast values (already hourly from API)
     """
     gauge_hourly = gauge_raw["gauge_ft"].resample("1h").max()
     frames: list[pd.Series] = [gauge_hourly]
@@ -304,6 +491,17 @@ def to_hourly(
         frames.append(tide_obs["tide_ft"].resample("1h").mean())
     if tide_pred is not None and not tide_pred.empty:
         frames.append(tide_pred["tide_pred_ft"].resample("1h").mean())
+
+    # ERA5 weather (already hourly — just join)
+    if weather is not None and not weather.empty:
+        for col in weather.columns:
+            frames.append(weather[col])
+
+    # NWS forecast (already hourly — just join)
+    if nws is not None:
+        for col_name, nws_df in nws.items():
+            if not nws_df.empty:
+                frames.append(nws_df[col_name].resample("1h").mean())
 
     df = pd.concat(frames, axis=1, sort=True)
 
@@ -369,6 +567,38 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         for col in ["tide_ft", "tide_pred_ft", "storm_surge_ft", "tide_delta_3"]:
             out[col] = np.nan
+
+    # --- atmospheric / weather features ---
+    # These columns come from ERA5 (training) or Open-Meteo + NWS (prediction).
+    # Pressure deltas are strong indicators of approaching storms.
+    if "wx_pressure_hpa" in out.columns:
+        p = out["wx_pressure_hpa"]
+        out["wx_pressure_delta_3"] = p - p.shift(3)
+        out["wx_pressure_delta_6"] = p - p.shift(6)
+    else:
+        for col in ["wx_humidity_pct", "wx_wind_kmh", "wx_wind_gust_kmh",
+                     "wx_pressure_hpa", "wx_pressure_delta_3", "wx_pressure_delta_6"]:
+            if col not in out.columns:
+                out[col] = np.nan
+
+    # ERA5 precip rolling sums
+    if "wx_precip_era5_mm" in out.columns:
+        ep = out["wx_precip_era5_mm"]
+        out["wx_precip_era5_sum_3"] = ep.rolling(3, min_periods=1).sum()
+        out["wx_precip_era5_sum_6"] = ep.rolling(6, min_periods=1).sum()
+    else:
+        out["wx_precip_era5_mm"] = np.nan
+        out["wx_precip_era5_sum_3"] = np.nan
+        out["wx_precip_era5_sum_6"] = np.nan
+
+    # --- NWS forecast-only features (forward-looking QPF) ---
+    if "qpf_mm" in out.columns:
+        qpf_rev = out["qpf_mm"].iloc[::-1]
+        out["nws_qpf_3h"] = qpf_rev.rolling(3, min_periods=1).sum().iloc[::-1].values
+        out["nws_qpf_6h"] = qpf_rev.rolling(6, min_periods=1).sum().iloc[::-1].values
+    else:
+        out["nws_qpf_3h"] = np.nan
+        out["nws_qpf_6h"] = np.nan
 
     # --- time / indicator ---
     hour = out.index.hour
@@ -518,7 +748,10 @@ def fetch_all_training_data(end: datetime) -> pd.DataFrame:
     tide_pred = fetch_tide_predicted(start, end)
     print(f"  tide predicted rows: {len(tide_pred):,}", file=sys.stderr)
 
-    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
+    print(f"Fetching ERA5 weather {start.date()} -> {end.date()}", file=sys.stderr)
+    wx = fetch_weather_era5(start, end)
+
+    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, weather=wx)
     print(f"Merged hourly rows: {len(hourly):,}", file=sys.stderr)
     return hourly
 
@@ -549,7 +782,11 @@ def train_cmd(args):
 
     feats = build_features(hourly)
     feats["y"] = build_target(feats)
-    feats = feats.dropna(subset=FEATURE_COLUMNS + ["y"])
+    # NWS forecast columns are NaN during training (no historical data) — that's OK,
+    # HistGradientBoosting handles NaN natively. Exclude them from dropna.
+    NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
+    dropna_cols = [c for c in FEATURE_COLUMNS if c not in NWS_ONLY] + ["y"]
+    feats = feats.dropna(subset=dropna_cols)
     feats["y"] = feats["y"].astype(int)
 
     train_df, val_df, test_df = date_split(
@@ -681,7 +918,9 @@ def predict_cmd(args):
     q_raw = fetch_discharge_recent(hours=200)
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
-    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
+    nws = fetch_nws_forecast()
+    wx = fetch_weather_recent(hours=200)
+    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
     # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
     for name in rain_raw:

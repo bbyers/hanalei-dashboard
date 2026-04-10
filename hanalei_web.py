@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import threading
 import time
 import traceback
@@ -31,7 +30,9 @@ from hanalei_closure_model import (
     fetch_all_rain_recent,
     fetch_discharge_recent,
     fetch_gauge_recent,
+    fetch_nws_forecast,
     fetch_tide_recent,
+    fetch_weather_recent,
     to_hourly,
     _rain_col,
 )
@@ -62,19 +63,9 @@ def _run_prediction() -> dict:
     q_raw = fetch_discharge_recent(hours=200)
     rain_raw = fetch_all_rain_recent(hours=200)
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
-    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred)
-    # Find the last hour with *actual* rain observations (not fillna zeros).
-    # USGS data lags 1-2 hours, so trailing hourly buckets have 0 rain from fillna.
-    last_rain_ts = None
-    for name in rain_raw:
-        if not rain_raw[name].empty:
-            ts = rain_raw[name].index[-1]
-            if last_rain_ts is None or ts > last_rain_ts:
-                last_rain_ts = ts
-    if last_rain_ts is not None and not hourly.empty:
-        # Keep only hours up to and including the hour of the last rain reading
-        cutoff = last_rain_ts.floor("h")
-        hourly = hourly.loc[hourly.index <= cutoff]
+    nws = fetch_nws_forecast()
+    wx = fetch_weather_recent(hours=200)
+    hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
     feats = build_features(hourly).dropna(subset=bundle.features)
 
     if feats.empty:
@@ -127,18 +118,6 @@ def _run_prediction() -> dict:
     tide_now = float(latest["tide_ft"].iloc[0]) if "tide_ft" in latest.columns and not pd.isna(latest["tide_ft"].iloc[0]) else None
     surge_now = float(latest["storm_surge_ft"].iloc[0]) if "storm_surge_ft" in latest.columns and not pd.isna(latest["storm_surge_ft"].iloc[0]) else None
 
-    # Tide history (last 48h) — observed, predicted, and storm surge
-    tide_hist = []
-    for ts, row in last_48.iterrows():
-        entry = {"ts": ts.isoformat()}
-        if "tide_ft" in row.index and not pd.isna(row.get("tide_ft")):
-            entry["obs"] = round(float(row["tide_ft"]), 2)
-        if "tide_pred_ft" in row.index and not pd.isna(row.get("tide_pred_ft")):
-            entry["pred"] = round(float(row["tide_pred_ft"]), 2)
-        if "storm_surge_ft" in row.index and not pd.isna(row.get("storm_surge_ft")):
-            entry["surge"] = round(float(row["storm_surge_ft"]), 2)
-        tide_hist.append(entry)
-
     ts_utc = latest.index[-1]
     ts_hst = ts_utc - timedelta(hours=10)
 
@@ -160,7 +139,6 @@ def _run_prediction() -> dict:
         "rain_6h": rain_6h,
         "gauge_history": gauge_hist,
         "prob_history": prob_hist,
-        "tide_history": tide_hist,
         "horizon_h": bundle.horizon_h,
         "model_threshold_pct": round(bundle.threshold * 100, 1),
     }
@@ -575,8 +553,6 @@ HTML_TEMPLATE = r"""
 const AUTO_REFRESH_MS = 5 * 60 * 1000;  // auto-refresh every 5 minutes
 let gaugeChart = null;
 let probChart = null;
-let tideChart = null;
-let surgeChart = null;
 let nextRefreshTimer = null;
 let countdownInterval = null;
 let nextRefreshAt = null;
@@ -644,14 +620,6 @@ function renderDashboard(d) {
         <div style="position:relative; height:200px;"><canvas id="gaugeChart"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-title">Tide Level — Last 48 Hours</div>
-        <div style="position:relative; height:200px;"><canvas id="tideChart"></canvas></div>
-      </div>
-      <div class="chart-card">
-        <div class="chart-title">Storm Surge — Last 48 Hours</div>
-        <div style="position:relative; height:200px;"><canvas id="surgeChart"></canvas></div>
-      </div>
-      <div class="chart-card">
         <div class="chart-title">Rainfall by Gauge</div>
         <table class="rain-table">
           <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th></th></tr></thead>
@@ -703,8 +671,6 @@ function renderDashboard(d) {
   // Charts
   buildProbChart(d.prob_history || [], d.model_threshold_pct);
   buildGaugeChart(d.gauge_history || [], d.closure_ft);
-  buildTideChart(d.tide_history || []);
-  buildSurgeChart(d.tide_history || []);
 }
 
 function buildProbChart(data, threshPct) {
@@ -797,111 +763,6 @@ function buildGaugeChart(data, closureFt) {
           max: maxG,
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', stepSize: 2, callback: v => v + ' ft', autoSkip: false },
-        }
-      },
-      interaction: { intersect: false, mode: 'index' },
-      responsive: true,
-      maintainAspectRatio: false,
-    }
-  });
-}
-
-function buildTideChart(data) {
-  const ctx = document.getElementById('tideChart');
-  if (!ctx) return;
-  if (tideChart) tideChart.destroy();
-  tideChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: data.map(d => new Date(d.ts)),
-      datasets: [{
-        label: 'Observed',
-        data: data.map(d => d.obs ?? null),
-        borderColor: '#38bdf8',
-        backgroundColor: 'rgba(56,189,248,0.08)',
-        fill: true,
-        tension: 0.3,
-        pointRadius: 0,
-        borderWidth: 2,
-      }, {
-        label: 'Predicted (astronomical)',
-        data: data.map(d => d.pred ?? null),
-        borderColor: 'rgba(139,92,246,0.6)',
-        borderDash: [5, 3],
-        pointRadius: 0,
-        borderWidth: 1.5,
-        fill: false,
-      }]
-    },
-    options: {
-      plugins: {
-        legend: {
-          display: true,
-          position: 'top',
-          labels: { color: '#8892a8', boxWidth: 12, font: { size: 11 } }
-        }
-      },
-      scales: {
-        x: {
-          type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
-          grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', maxTicksLimit: 8 },
-        },
-        y: {
-          beginAtZero: true,
-          min: -0.5,
-          max: 3.5,
-          grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', stepSize: 0.5, callback: v => v + ' ft' },
-        }
-      },
-      interaction: { intersect: false, mode: 'index' },
-      responsive: true,
-      maintainAspectRatio: false,
-    }
-  });
-}
-
-function buildSurgeChart(data) {
-  const ctx = document.getElementById('surgeChart');
-  if (!ctx) return;
-  if (surgeChart) surgeChart.destroy();
-  surgeChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: data.map(d => new Date(d.ts)),
-      datasets: [{
-        data: data.map(d => d.surge ?? null),
-        borderColor: '#f97316',
-        backgroundColor: 'rgba(249,115,22,0.1)',
-        fill: true,
-        tension: 0.3,
-        pointRadius: 0,
-        borderWidth: 2,
-      }, {
-        data: data.map(() => 0),
-        borderColor: 'rgba(255,255,255,0.15)',
-        borderDash: [4, 4],
-        pointRadius: 0,
-        borderWidth: 1,
-        fill: false,
-      }]
-    },
-    options: {
-      plugins: { legend: { display: false } },
-      scales: {
-        x: {
-          type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
-          grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', maxTicksLimit: 8 },
-        },
-        y: {
-          min: -1.0,
-          max: 1.5,
-          grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', stepSize: 0.5, callback: v => v.toFixed(1) + ' ft' },
         }
       },
       interaction: { intersect: false, mode: 'index' },
@@ -1004,10 +865,10 @@ scheduleAutoRefresh();
 
 def main():
     parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard")
-    parser.add_argument("--model", default="./model.joblib",
+    parser.add_argument("--model", default="./hanalei_v3_out/model.joblib",
                         help="Path to trained model.joblib")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)))
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     global _bundle
@@ -1023,30 +884,6 @@ def main():
 
     print(f"\n  Dashboard: http://{args.host}:{args.port}\n")
     app.run(host=args.host, port=args.port, debug=False)
-
-
-_init_done = False
-
-def _init_app():
-    """Initialize model and background thread. Safe to call multiple times."""
-    global _bundle, _init_done
-    if _init_done:
-        return
-    _init_done = True
-    model_path = os.environ.get("MODEL_PATH", "./model.joblib")
-    if Path(model_path).exists():
-        _bundle = joblib.load(model_path)
-        print(f"Loaded model: horizon={_bundle.horizon_h}h, threshold={_bundle.threshold:.4f}, "
-              f"features={len(_bundle.features)}")
-        t = threading.Thread(target=_prediction_loop, daemon=True)
-        t.start()
-        print(f"Background predictor started (refreshes every {_REFRESH_SECONDS}s)")
-    else:
-        print(f"WARNING: model not found at {model_path}")
-
-
-# Auto-init when imported by gunicorn
-_init_app()
 
 
 if __name__ == "__main__":
