@@ -115,6 +115,18 @@ def _run_prediction() -> dict:
     tide_now = float(latest["tide_ft"].iloc[0]) if "tide_ft" in latest.columns and not pd.isna(latest["tide_ft"].iloc[0]) else None
     surge_now = float(latest["storm_surge_ft"].iloc[0]) if "storm_surge_ft" in latest.columns and not pd.isna(latest["storm_surge_ft"].iloc[0]) else None
 
+    # Tide history (last 48h) — observed, predicted, and storm surge
+    tide_hist = []
+    for ts, row in last_48.iterrows():
+        entry = {"ts": ts.isoformat()}
+        if "tide_ft" in row.index and not pd.isna(row.get("tide_ft")):
+            entry["obs"] = round(float(row["tide_ft"]), 2)
+        if "tide_pred_ft" in row.index and not pd.isna(row.get("tide_pred_ft")):
+            entry["pred"] = round(float(row["tide_pred_ft"]), 2)
+        if "storm_surge_ft" in row.index and not pd.isna(row.get("storm_surge_ft")):
+            entry["surge"] = round(float(row["storm_surge_ft"]), 2)
+        tide_hist.append(entry)
+
     ts_utc = latest.index[-1]
     ts_hst = ts_utc - timedelta(hours=10)
 
@@ -136,6 +148,7 @@ def _run_prediction() -> dict:
         "rain_6h": rain_6h,
         "gauge_history": gauge_hist,
         "prob_history": prob_hist,
+        "tide_history": tide_hist,
         "horizon_h": bundle.horizon_h,
         "model_threshold_pct": round(bundle.threshold * 100, 1),
     }
@@ -550,6 +563,8 @@ HTML_TEMPLATE = r"""
 const AUTO_REFRESH_MS = 5 * 60 * 1000;  // auto-refresh every 5 minutes
 let gaugeChart = null;
 let probChart = null;
+let tideChart = null;
+let surgeChart = null;
 let nextRefreshTimer = null;
 let countdownInterval = null;
 let nextRefreshAt = null;
@@ -617,6 +632,14 @@ function renderDashboard(d) {
         <div style="position:relative; height:200px;"><canvas id="gaugeChart"></canvas></div>
       </div>
       <div class="chart-card">
+        <div class="chart-title">Tide Level — Last 48 Hours</div>
+        <div style="position:relative; height:200px;"><canvas id="tideChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Storm Surge — Last 48 Hours</div>
+        <div style="position:relative; height:200px;"><canvas id="surgeChart"></canvas></div>
+      </div>
+      <div class="chart-card">
         <div class="chart-title">Rainfall by Gauge</div>
         <table class="rain-table">
           <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th></th></tr></thead>
@@ -668,6 +691,8 @@ function renderDashboard(d) {
   // Charts
   buildProbChart(d.prob_history || [], d.model_threshold_pct);
   buildGaugeChart(d.gauge_history || [], d.closure_ft);
+  buildTideChart(d.tide_history || []);
+  buildSurgeChart(d.tide_history || []);
 }
 
 function buildProbChart(data, threshPct) {
@@ -760,6 +785,111 @@ function buildGaugeChart(data, closureFt) {
           max: maxG,
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', stepSize: 2, callback: v => v + ' ft', autoSkip: false },
+        }
+      },
+      interaction: { intersect: false, mode: 'index' },
+      responsive: true,
+      maintainAspectRatio: false,
+    }
+  });
+}
+
+function buildTideChart(data) {
+  const ctx = document.getElementById('tideChart');
+  if (!ctx) return;
+  if (tideChart) tideChart.destroy();
+  tideChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => new Date(d.ts)),
+      datasets: [{
+        label: 'Observed',
+        data: data.map(d => d.obs ?? null),
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56,189,248,0.08)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2,
+      }, {
+        label: 'Predicted (astronomical)',
+        data: data.map(d => d.pred ?? null),
+        borderColor: 'rgba(139,92,246,0.6)',
+        borderDash: [5, 3],
+        pointRadius: 0,
+        borderWidth: 1.5,
+        fill: false,
+      }]
+    },
+    options: {
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          labels: { color: '#8892a8', boxWidth: 12, font: { size: 11 } }
+        }
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+        },
+        y: {
+          beginAtZero: true,
+          min: -0.5,
+          max: 3.5,
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', stepSize: 0.5, callback: v => v + ' ft' },
+        }
+      },
+      interaction: { intersect: false, mode: 'index' },
+      responsive: true,
+      maintainAspectRatio: false,
+    }
+  });
+}
+
+function buildSurgeChart(data) {
+  const ctx = document.getElementById('surgeChart');
+  if (!ctx) return;
+  if (surgeChart) surgeChart.destroy();
+  surgeChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => new Date(d.ts)),
+      datasets: [{
+        data: data.map(d => d.surge ?? null),
+        borderColor: '#f97316',
+        backgroundColor: 'rgba(249,115,22,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2,
+      }, {
+        data: data.map(() => 0),
+        borderColor: 'rgba(255,255,255,0.15)',
+        borderDash: [4, 4],
+        pointRadius: 0,
+        borderWidth: 1,
+        fill: false,
+      }]
+    },
+    options: {
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+        },
+        y: {
+          min: -1.0,
+          max: 1.5,
+          grid: { color: 'rgba(30,45,74,0.5)' },
+          ticks: { color: '#8892a8', stepSize: 0.5, callback: v => v.toFixed(1) + ' ft' },
         }
       },
       interaction: { intersect: false, mode: 'index' },
