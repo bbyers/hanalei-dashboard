@@ -57,23 +57,38 @@ _fetching = False                   # True while a fetch is in progress
 # Background prediction loop
 # ---------------------------------------------------------------------------
 
+def _log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _run_prediction() -> dict:
     """Run one prediction cycle, return result dict."""
     bundle = _bundle
+    _log("[predict] fetching gauge...")
     gauge_raw = fetch_gauge_recent(hours=200)
+    _log(f"[predict] gauge: {len(gauge_raw)} rows")
+    _log("[predict] fetching discharge...")
     q_raw = fetch_discharge_recent(hours=200)
+    _log(f"[predict] discharge: {len(q_raw)} rows")
+    _log("[predict] fetching rain...")
     rain_raw = fetch_all_rain_recent(hours=200)
+    _log(f"[predict] rain: {sum(len(v) for v in rain_raw.values())} total rows")
+    _log("[predict] fetching tide...")
     tide_obs, tide_pred = fetch_tide_recent(hours=200)
+    _log(f"[predict] tide obs: {len(tide_obs)}, pred: {len(tide_pred)}")
     try:
+        _log("[predict] fetching NWS...")
         nws = fetch_nws_forecast()
     except Exception as e:
-        print(f"  NWS forecast failed: {e}", file=sys.stderr)
+        _log(f"[predict] NWS failed: {e}")
         nws = None
     try:
+        _log("[predict] fetching weather...")
         wx = fetch_weather_recent(hours=200)
     except Exception as e:
-        print(f"  Weather recent failed: {e}", file=sys.stderr)
+        _log(f"[predict] weather failed: {e}")
         wx = pd.DataFrame()
+    _log("[predict] building hourly...")
     hourly = to_hourly(gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred, nws=nws, weather=wx)
     # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
@@ -85,18 +100,24 @@ def _run_prediction() -> dict:
     if last_rain_ts is not None and not hourly.empty:
         cutoff = last_rain_ts.floor("h")
         hourly = hourly.loc[hourly.index <= cutoff]
+    _log(f"[predict] hourly rows: {len(hourly)}, cols: {list(hourly.columns)[:5]}...")
     # NWS forecast columns may be NaN for most rows — exclude from dropna
     # (HistGradientBoosting handles NaN natively)
     NWS_ONLY = {"nws_qpf_3h", "nws_qpf_6h"}
     dropna_cols = [c for c in bundle.features if c not in NWS_ONLY]
+    _log(f"[predict] building features, dropna on {len(dropna_cols)} cols...")
     feats = build_features(hourly).dropna(subset=dropna_cols)
+    _log(f"[predict] feats rows after dropna: {len(feats)}")
 
     if feats.empty:
+        _log("[predict] ERROR: feats empty after dropna")
         return {"status": "error", "message": "Insufficient recent data from USGS/NOAA"}
 
     latest = feats.iloc[[-1]]
     x = latest[bundle.features].values
+    _log("[predict] running model.predict_proba...")
     prob = float(bundle.model.predict_proba(x)[0, 1])
+    _log(f"[predict] DONE — prob={prob:.4f}")
     alert = bool(prob >= bundle.threshold)
     gauge_now = float(latest["gauge_ft"].iloc[0])
     already_above = bool(gauge_now >= bundle.closure_ft)
