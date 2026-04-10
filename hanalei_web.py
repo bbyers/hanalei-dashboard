@@ -116,8 +116,13 @@ def _run_prediction() -> dict:
     latest = feats.iloc[[-1]]
     x = latest[bundle.features].values
     _log("[predict] running model.predict_proba...")
-    prob = float(bundle.model.predict_proba(x)[0, 1])
-    _log(f"[predict] DONE — prob={prob:.4f}")
+    raw_prob = float(bundle.model.predict_proba(x)[0, 1])
+    calibrator = getattr(bundle, "calibrator", None)
+    if calibrator is not None:
+        prob = float(calibrator.predict([raw_prob])[0])
+    else:
+        prob = raw_prob
+    _log(f"[predict] DONE — raw={raw_prob:.4f}, calibrated={prob:.4f}")
     alert = bool(prob >= bundle.threshold)
     gauge_now = float(latest["gauge_ft"].iloc[0])
     already_above = bool(gauge_now >= bundle.closure_ft)
@@ -163,6 +168,8 @@ def _run_prediction() -> dict:
         recent_feats = feats.tail(48)
         x_recent = recent_feats[bundle.features].values
         probs_recent = bundle.model.predict_proba(x_recent)[:, 1]
+        if calibrator is not None:
+            probs_recent = calibrator.predict(probs_recent)
         for ts, p in zip(recent_feats.index, probs_recent):
             prob_hist.append({
                 "ts": ts.isoformat(),
