@@ -883,17 +883,24 @@ def main():
     app.run(host=args.host, port=args.port, debug=False)
 
 
+_init_done = False
+
 def _init_app():
-    """Initialize model and background thread for both gunicorn and direct run."""
-    global _bundle
+    """Initialize model and background thread. Safe to call multiple times."""
+    global _bundle, _init_done
+    if _init_done:
+        return
+    _init_done = True
     model_path = os.environ.get("MODEL_PATH", "./model.joblib")
-    if _bundle is None and Path(model_path).exists():
+    if Path(model_path).exists():
         _bundle = joblib.load(model_path)
         print(f"Loaded model: horizon={_bundle.horizon_h}h, threshold={_bundle.threshold:.4f}, "
               f"features={len(_bundle.features)}")
         t = threading.Thread(target=_prediction_loop, daemon=True)
         t.start()
         print(f"Background predictor started (refreshes every {_REFRESH_SECONDS}s)")
+    else:
+        print(f"WARNING: model not found at {model_path}")
 
 
 # Auto-init when imported by gunicorn
