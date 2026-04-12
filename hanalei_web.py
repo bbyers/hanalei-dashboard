@@ -221,9 +221,9 @@ def _run_prediction() -> dict:
     _log("[predict] computing prob history...")
 
     def _to_hst(ts):
-        """Convert UTC timestamp to HST, emit as fake-UTC so Chart.js won't shift again."""
+        """Convert UTC timestamp to HST as naive string (no timezone suffix)."""
         hst = ts - timedelta(hours=10)
-        return hst.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return hst.strftime("%Y-%m-%dT%H:%M:%S")
 
     # Build prob lookup: map prep time_idx -> probability
     # Use decoder_time_idx from dataset to get the actual time each prediction corresponds to
