@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Hanalei Bridge Closure Probability — Live Dashboard.
+"""Hanalei Bridge Closure Probability — Live Dashboard (v7: TFT).
 
 A Flask web app that displays a running probability of Hanalei River bridge
-closure (gauge > 5.0 ft) within the next 3 hours, powered by the v3 ML model.
+closure (gauge > 5.0 ft) within the next 3 hours, powered by the v7 TFT model.
 
 Usage:
-    python hanalei_web.py [--model ./hanalei_v3_out/model.joblib] [--port 5000]
+    python hanalei_web.py [--model ./hanalei_v7_out] [--port 5000]
 """
 from __future__ import annotations
 
@@ -21,26 +21,40 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import torch
 from flask import Flask, jsonify, render_template_string
 
 print("[startup] importing hanalei_closure_model...", file=sys.stderr, flush=True)
 try:
     from hanalei_closure_model import (
         RAIN_GAUGES,
-        TrainBundle,
-        build_features,
+        STEPS_PER_HOUR,
+        TIMESTEP_MIN,
+        TFTBundle,
+        TFT_QUANTILES,
+        build_tft_features,
         fetch_all_rain_recent,
         fetch_bridge_gauge_recent,
         fetch_discharge_recent,
         fetch_gauge_recent,
+        fetch_google_weather,
         fetch_nasa_power_precip_recent,
         fetch_nws_forecast,
         fetch_soil_moisture_recent,
         fetch_tide_recent,
         fetch_weather_recent,
+        load_tft_bundle,
+        prepare_tft_dataframe,
+        build_tft_dataset,
+        quantiles_to_closure_prob,
+        tft_predict_quantiles,
         to_hourly,
         _rain_col,
     )
+    from pytorch_forecasting import TemporalFusionTransformer
+    # Legacy alias
+    TrainBundle = TFTBundle
+    build_features = build_tft_features
     print("[startup] import OK", file=sys.stderr, flush=True)
 except Exception as e:
     print(f"[startup] IMPORT FAILED: {e}", file=sys.stderr, flush=True)
@@ -53,7 +67,9 @@ except Exception as e:
 
 app = Flask(__name__)
 
-_bundle: TrainBundle | None = None
+_bundle: TFTBundle | None = None
+_tft_model: TemporalFusionTransformer | None = None
+_calibrator = None
 _latest: dict = {"status": "loading", "message": "Fetching initial data..."}
 _history: list[dict] = []          # last 72 hours of predictions
 _lock = threading.Lock()
@@ -71,8 +87,11 @@ def _log(msg):
 
 
 def _run_prediction() -> dict:
-    """Run one prediction cycle, return result dict."""
+    """Run one prediction cycle using TFT, return result dict."""
     bundle = _bundle
+    model = _tft_model
+    calibrator = _calibrator
+
     _log("[predict] fetching gauge...")
     gauge_raw = fetch_gauge_recent(hours=200)
     _log(f"[predict] gauge: {len(gauge_raw)} rows")
@@ -118,71 +137,90 @@ def _run_prediction() -> dict:
         _log(f"[predict] sat precip: {len(sat_precip) if sat_precip is not None else 0} rows")
     except Exception as e:
         _log(f"[predict] satellite precip failed: {e}")
-    _log("[predict] building hourly...")
-    hourly = to_hourly(
+    gw = None
+    try:
+        _log("[predict] fetching Google Weather...")
+        gw = fetch_google_weather()
+        _log(f"[predict] google weather: {len(gw) if gw is not None else 0} rows")
+    except Exception as e:
+        _log(f"[predict] Google Weather failed: {e}")
+
+    _log("[predict] building 15-min merged data...")
+    merged = to_hourly(
         gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred,
-        nws=nws, weather=wx, bridge_raw=bridge_raw, soil_moisture=soil, sat_precip=sat_precip,
+        nws=nws, weather=wx, bridge_raw=bridge_raw, soil_moisture=soil,
+        sat_precip=sat_precip, google_weather=gw,
     )
-    # Trim trailing hours beyond the last actual rain observation (USGS lags 1-2h)
+    # Trim trailing rows beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
     for name in rain_raw:
         if not rain_raw[name].empty:
             ts = rain_raw[name].index[-1]
             if last_rain_ts is None or ts > last_rain_ts:
                 last_rain_ts = ts
-    if last_rain_ts is not None and not hourly.empty:
-        cutoff = last_rain_ts.floor("h")
-        hourly = hourly.loc[hourly.index <= cutoff]
-    _log(f"[predict] hourly rows: {len(hourly)}, cols: {list(hourly.columns)[:5]}...")
-    # These features may legitimately be NaN — model handles NaN natively
-    NAN_OK = {"nws_qpf_3h", "nws_qpf_6h",
-              "bridge_ft", "bridge_lag_1", "bridge_lag_3", "bridge_lag_6",
-              "bridge_delta_1", "bridge_delta_3", "bridge_above_7ft", "bridge_gauge_diff",
-              "sat_precip_mm", "sat_precip_sum_3d", "sat_precip_sum_7d",
-              "soil_moisture_shallow", "soil_moisture_mid", "soil_moisture_deep",
-              "soil_moisture_delta_24", "rain_x_soil_moisture"}
-    dropna_cols = [c for c in bundle.features if c not in NAN_OK]
-    _log(f"[predict] building features, dropna on {len(dropna_cols)} cols...")
-    feats = build_features(hourly).dropna(subset=dropna_cols)
-    _log(f"[predict] feats rows after dropna: {len(feats)}")
+    if last_rain_ts is not None and not merged.empty:
+        freq_str = f"{TIMESTEP_MIN}min"
+        cutoff = last_rain_ts.floor(freq_str)
+        merged = merged.loc[merged.index <= cutoff]
 
-    if feats.empty:
-        _log("[predict] ERROR: feats empty after dropna")
+    _log(f"[predict] merged rows: {len(merged)}, cols: {list(merged.columns)[:5]}...")
+
+    feats = build_tft_features(merged)
+    feats = feats.dropna(subset=["gauge_ft"])
+    _log(f"[predict] feats rows: {len(feats)}")
+
+    min_rows = bundle.encoder_length + bundle.prediction_length
+    if len(feats) < min_rows:
+        _log(f"[predict] ERROR: need {min_rows} rows, only have {len(feats)}")
         return {"status": "error", "message": "Insufficient recent data from USGS/NOAA"}
 
-    latest = feats.iloc[[-1]]
-    x = latest[bundle.features].values
-    _log("[predict] running model.predict_proba...")
-    raw_prob = float(bundle.model.predict_proba(x)[0, 1])
-    calibrator = getattr(bundle, "calibrator", None)
-    if calibrator is not None:
-        prob = float(calibrator.predict([raw_prob])[0])
-    else:
-        prob = raw_prob
-    gauge_now = float(latest["gauge_ft"].iloc[0])
+    # Prepare for TFT
+    prep, _ = prepare_tft_dataframe(feats, fill_medians=bundle.fill_medians)
+
+    # Use last N rows for prediction (keep enough for encoder + decoder)
+    if len(prep) > min_rows * 2:
+        prep = prep.iloc[-min_rows * 2:]
+        prep["time_idx"] = np.arange(len(prep))
+
+    pred_dataset = build_tft_dataset(
+        prep, encoder_length=bundle.encoder_length,
+        prediction_length=bundle.prediction_length, training=True,
+    )
+
+    _log("[predict] running TFT inference...")
+    preds = tft_predict_quantiles(model, pred_dataset)
+    if len(preds) == 0:
+        return {"status": "error", "message": "TFT produced no predictions"}
+
+    # Latest prediction
+    last_pred = preds[-1:]
+    raw_prob = float(quantiles_to_closure_prob(last_pred, bundle.quantiles)[0])
+    prob = float(calibrator.predict([raw_prob])[0]) if calibrator else raw_prob
+
+    gauge_now = float(feats["gauge_ft"].iloc[-1])
     already_above = bool(gauge_now >= bundle.closure_ft)
-    # If gauge is already at/above flood stage, override to 100%
     if already_above:
         prob = 1.0
     _log(f"[predict] DONE — raw={raw_prob:.4f}, calibrated={prob:.4f}, above={already_above}")
     alert = bool(prob >= bundle.threshold)
 
+    # Rain totals (compute from raw 15-min data)
+    S = STEPS_PER_HOUR
     rain_6h = {}
-    for name, _ in RAIN_GAUGES:
-        col = f"{_rain_col(name)}_sum_6"
-        if col in latest.columns:
-            rain_6h[name] = round(float(latest[col].iloc[0]), 2)
-
     rain_1h = {}
     for name, _ in RAIN_GAUGES:
-        col = f"{_rain_col(name)}_sum_1"
-        if col in latest.columns:
-            rain_1h[name] = round(float(latest[col].iloc[0]), 2)
+        col = _rain_col(name)
+        if col in feats.columns:
+            rain_6h[name] = round(float(feats[col].iloc[-6*S:].sum()), 2)
+            rain_1h[name] = round(float(feats[col].iloc[-1*S:].sum()), 2)
+        else:
+            rain_6h[name] = 0.0
+            rain_1h[name] = 0.0
 
     _log("[predict] building history arrays...")
     # Gauge history for sparkline (last 48h)
     gauge_hist = []
-    last_48 = feats.tail(48 * 4)
+    last_48 = feats.tail(48 * S)
     for ts, row in last_48.iterrows():
         gauge_hist.append({
             "ts": ts.isoformat(),
@@ -201,29 +239,31 @@ def _run_prediction() -> dict:
             entry["surge_ft"] = round(float(row["storm_surge_ft"]), 2)
         tide_hist.append(entry)
 
-    _log("[predict] computing prob history (48h @ 15-min)...")
-    # Probability history from feats (last 48h)
+    _log("[predict] computing prob history...")
+    # Probability history: use all TFT predictions from the batch
     prob_hist = []
-    if len(feats) > 1:
-        recent_feats = feats.tail(48 * 4)
-        x_recent = recent_feats[bundle.features].values
-        probs_recent = bundle.model.predict_proba(x_recent)[:, 1]
-        if calibrator is not None:
-            probs_recent = calibrator.predict(probs_recent)
-        for ts, p in zip(recent_feats.index, probs_recent):
+    if len(preds) > 1:
+        all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
+        if calibrator:
+            all_probs = calibrator.predict(all_probs)
+        # Align with feats timestamps (predictions correspond to tail of dataset)
+        n_preds = len(all_probs)
+        pred_feats = feats.iloc[-n_preds:]
+        for ts, p in zip(pred_feats.index, all_probs):
             prob_hist.append({
                 "ts": ts.isoformat(),
                 "prob": round(float(p), 4),
             })
 
     # Discharge
-    q_now = float(latest["q_cfs"].iloc[0]) if "q_cfs" in latest.columns and not pd.isna(latest["q_cfs"].iloc[0]) else None
+    latest_row = feats.iloc[-1]
+    q_now = float(latest_row["q_cfs"]) if "q_cfs" in feats.columns and not pd.isna(latest_row["q_cfs"]) else None
 
     # Tide
-    tide_now = float(latest["tide_ft"].iloc[0]) if "tide_ft" in latest.columns and not pd.isna(latest["tide_ft"].iloc[0]) else None
-    surge_now = float(latest["storm_surge_ft"].iloc[0]) if "storm_surge_ft" in latest.columns and not pd.isna(latest["storm_surge_ft"].iloc[0]) else None
+    tide_now = float(latest_row["tide_ft"]) if "tide_ft" in feats.columns and not pd.isna(latest_row["tide_ft"]) else None
+    surge_now = float(latest_row["storm_surge_ft"]) if "storm_surge_ft" in feats.columns and not pd.isna(latest_row["storm_surge_ft"]) else None
 
-    ts_utc = latest.index[-1]
+    ts_utc = feats.index[-1]
     ts_hst = ts_utc - timedelta(hours=10)
 
     _log(f"[predict] returning result — status=ok, gauge={gauge_now:.2f}, prob={prob:.4f}")
@@ -309,9 +349,9 @@ def api_debug():
             "initialized": _initialized,
             "init_error": _init_error,
             "bundle_loaded": _bundle is not None,
-            "bundle_features": len(_bundle.features) if _bundle else None,
+            "tft_model_loaded": _tft_model is not None,
             "cwd": str(Path.cwd()),
-            "model_exists": Path("model.joblib").exists(),
+            "model_exists": Path("bundle.json").exists() or Path("model.joblib").exists(),
         })
 
 
@@ -1069,16 +1109,51 @@ initialPoll();
 # ---------------------------------------------------------------------------
 
 def _init_model_and_thread(model_path: str):
-    """Load the model and start the background prediction thread."""
-    global _bundle
-    print(f"Loading model from {model_path}...", file=sys.stderr, flush=True)
-    # Fix pickle: model was saved when hanalei_closure_model was __main__,
-    # so pickle looks for TrainBundle in __main__. Register it there.
-    import __main__
-    __main__.TrainBundle = TrainBundle
-    _bundle = joblib.load(model_path)
+    """Load the TFT model and start the background prediction thread."""
+    global _bundle, _tft_model, _calibrator
+    model_dir = Path(model_path)
+    if model_dir.is_file():
+        model_dir = model_dir.parent
+
+    print(f"Loading TFT model from {model_dir}...", file=sys.stderr, flush=True)
+
+    # Load TFTBundle
+    bundle_path = model_dir / "bundle.json"
+    if bundle_path.exists():
+        _bundle = load_tft_bundle(bundle_path)
+    else:
+        raise FileNotFoundError(f"bundle.json not found in {model_dir}")
+
+    # Load TFT checkpoint (CPU-only: patch torch.zeros for torchmetrics CUDA device refs)
+    ckpt_path = model_dir / "tft_model_cpu.ckpt"
+    if not ckpt_path.exists():
+        ckpt_path = model_dir / "tft_model.ckpt"
+    if ckpt_path.exists():
+        _orig_zeros = torch.zeros
+        def _patched_zeros(*args, **kwargs):
+            if 'device' in kwargs and kwargs['device'] is not None:
+                dev = kwargs['device']
+                if (isinstance(dev, torch.device) and dev.type == 'cuda') or \
+                   (isinstance(dev, str) and 'cuda' in dev):
+                    kwargs['device'] = torch.device('cpu')
+            return _orig_zeros(*args, **kwargs)
+        torch.zeros = _patched_zeros
+        _tft_model = TemporalFusionTransformer.load_from_checkpoint(
+            str(ckpt_path), map_location="cpu",
+        )
+        torch.zeros = _orig_zeros
+        _tft_model.eval()
+    else:
+        raise FileNotFoundError(f"tft_model_cpu.ckpt not found in {model_dir}")
+
+    # Load calibrator
+    cal_path = model_dir / "calibrator.joblib"
+    if cal_path.exists():
+        _calibrator = joblib.load(cal_path)
+
     print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
-          f"features: {len(_bundle.features)}", file=sys.stderr, flush=True)
+          f"encoder: {_bundle.encoder_length}, params: {sum(p.numel() for p in _tft_model.parameters()):,}",
+          file=sys.stderr, flush=True)
 
     t = threading.Thread(target=_prediction_loop, daemon=True)
     t.start()
@@ -1087,9 +1162,9 @@ def _init_model_and_thread(model_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard")
-    parser.add_argument("--model", default="./hanalei_v3_out/model.joblib",
-                        help="Path to trained model.joblib")
+    parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard (v7 TFT)")
+    parser.add_argument("--model", default="./hanalei_v7_out",
+                        help="Path to model directory or bundle.json")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
@@ -1107,14 +1182,20 @@ _init_error = None
 def _lazy_init():
     global _initialized, _init_error, _latest
     if not _initialized:
-        for _p in ["model.joblib", "./model.joblib"]:
+        # Search for TFT model (bundle.json) or legacy model (model.joblib)
+        search_paths = [
+            "bundle.json", "./bundle.json",
+            "hanalei_v7_out/bundle.json", "./hanalei_v7_out/bundle.json",
+            "hanalei_v7_out", "./hanalei_v7_out",
+        ]
+        for _p in search_paths:
             if Path(_p).exists():
                 try:
                     _log(f"[init] lazy init from {_p} (worker pid={__import__('os').getpid()})")
                     _init_model_and_thread(_p)
                     _initialized = True
                     _init_error = None
-                    _log("[init] SUCCESS — model loaded, background thread started")
+                    _log("[init] SUCCESS — TFT model loaded, background thread started")
                 except Exception as e:
                     _init_error = traceback.format_exc()
                     _log(f"[init] FAILED: {e}")
@@ -1123,9 +1204,9 @@ def _lazy_init():
                                "trace": _init_error}
                     _initialized = True  # don't retry every request — surface the error
                 return
-        _log("[init] ERROR: model.joblib not found!")
-        _init_error = "model.joblib not found"
-        _latest = {"status": "error", "message": "model.joblib not found"}
+        _log("[init] ERROR: bundle.json not found!")
+        _init_error = "bundle.json not found"
+        _latest = {"status": "error", "message": "TFT model (bundle.json) not found"}
         _initialized = True
 
 if __name__ == "__main__":

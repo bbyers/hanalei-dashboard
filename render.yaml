@@ -3,7 +3,9 @@ services:
     name: hanalei-dashboard
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn hanalei_web:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180
+    startCommand: gunicorn hanalei_web:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.4
+      - key: GOOGLE_WEATHER_API_KEY
+        value: AIzaSyAfOywED62_gKFw6fRpyYfeqSrbspJu6Hg
