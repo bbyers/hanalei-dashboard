@@ -226,16 +226,21 @@ def _run_prediction() -> dict:
         return hst.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Probability history: use all TFT predictions from the batch
+    # Predictions[i] is about the time encoder_length steps ahead of position i.
+    # Drop the first encoder_length predictions so they align with the end of feats.
     prob_hist = []
-    n_preds = 0
-    if len(preds) > 1:
+    EL = bundle.encoder_length
+    n_hist = 0
+    if len(preds) > EL:
         all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
         if calibrator:
             all_probs = calibrator.predict(all_probs)
-        n_preds = len(all_probs)
-        pred_feats = feats.iloc[-n_preds:]
-        for ts, p in zip(pred_feats.index, all_probs):
-            gauge_at_ts = float(pred_feats.loc[ts, "gauge_ft"])
+        # Skip first EL predictions (they map to times beyond our window)
+        aligned_probs = all_probs[EL:]
+        n_hist = len(aligned_probs)
+        hist_slice = feats.iloc[-n_hist:]
+        for ts, p in zip(hist_slice.index, aligned_probs):
+            gauge_at_ts = float(hist_slice.loc[ts, "gauge_ft"])
             if gauge_at_ts >= bundle.closure_ft:
                 p = 1.0
             prob_hist.append({
@@ -245,7 +250,7 @@ def _run_prediction() -> dict:
 
     _log("[predict] building history arrays...")
     # Use same time range as prob history for gauge and tide (all charts aligned)
-    hist_feats = feats.iloc[-n_preds:] if n_preds > 0 else feats.tail(5 * 24 * S)
+    hist_feats = feats.iloc[-n_hist:] if n_hist > 0 else feats.tail(5 * 24 * S)
 
     gauge_hist = []
     for ts, row in hist_feats.iterrows():
