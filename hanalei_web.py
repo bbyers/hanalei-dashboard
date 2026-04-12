@@ -859,7 +859,7 @@ function buildProbChart(data, threshPct) {
   probChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(d.ts)),
+      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
       datasets: [{
         data: data.map(d => d.prob * 100),
         borderColor: '#38bdf8',
@@ -882,9 +882,9 @@ function buildProbChart(data, threshPct) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
           grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+          ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
         y: {
           beginAtZero: true,
@@ -909,7 +909,7 @@ function buildGaugeChart(data, closureFt) {
   gaugeChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(d.ts)),
+      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
       datasets: [{
         data: data.map(d => d.gauge_ft),
         borderColor: '#22c55e',
@@ -932,9 +932,9 @@ function buildGaugeChart(data, closureFt) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
           grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+          ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
         y: {
           beginAtZero: true,
@@ -958,7 +958,7 @@ function buildTideChart(data) {
   tideChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(d.ts)),
+      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
       datasets: [{
         label: 'Observed',
         data: data.map(d => d.tide_ft ?? null),
@@ -992,9 +992,9 @@ function buildTideChart(data) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
           grid: { color: 'rgba(30,45,74,0.5)' },
-          ticks: { color: '#8892a8', maxTicksLimit: 8 },
+          ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
         y: {
           min: -1,
