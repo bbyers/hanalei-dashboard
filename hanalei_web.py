@@ -883,6 +883,7 @@ function buildProbChart(data, threshPct) {
     data: {
       labels: data.map(d => new Date(d.ts)),
       datasets: [{
+        label: 'Probability',
         data: data.map(d => d.prob * 100),
         borderColor: '#38bdf8',
         backgroundColor: 'rgba(56,189,248,0.1)',
@@ -891,6 +892,7 @@ function buildProbChart(data, threshPct) {
         pointRadius: 0,
         borderWidth: 2,
       }, {
+        label: '_threshold',
         data: data.map(() => threshPct),
         borderColor: 'rgba(239,68,68,0.5)',
         borderDash: [6, 4],
@@ -900,11 +902,20 @@ function buildProbChart(data, threshPct) {
       }]
     },
     options: {
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          filter: (item) => !item.dataset.label?.startsWith('_'),
+          callbacks: {
+            title: (items) => { const d = items[0]?.parsed?.x ? new Date(items[0].parsed.x) : null; return d ? d.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''; },
+            label: (item) => item.formattedValue + '%',
+          }
+        }
+      },
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
@@ -933,6 +944,7 @@ function buildGaugeChart(data, closureFt) {
     data: {
       labels: data.map(d => new Date(d.ts)),
       datasets: [{
+        label: 'Gauge',
         data: data.map(d => d.gauge_ft),
         borderColor: '#22c55e',
         backgroundColor: 'rgba(34,197,94,0.1)',
@@ -941,6 +953,7 @@ function buildGaugeChart(data, closureFt) {
         pointRadius: 0,
         borderWidth: 2,
       }, {
+        label: '_closure',
         data: data.map(() => closureFt),
         borderColor: 'rgba(239,68,68,0.6)',
         borderDash: [6, 4],
@@ -950,11 +963,20 @@ function buildGaugeChart(data, closureFt) {
       }]
     },
     options: {
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          filter: (item) => !item.dataset.label?.startsWith('_'),
+          callbacks: {
+            title: (items) => { const d = items[0]?.parsed?.x ? new Date(items[0].parsed.x) : null; return d ? d.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''; },
+            label: (item) => item.formattedValue + ' ft',
+          }
+        }
+      },
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
@@ -1010,11 +1032,19 @@ function buildTideChart(data) {
       }]
     },
     options: {
-      plugins: { legend: { display: true, labels: { color: '#8892a8', boxWidth: 12, padding: 8 } } },
+      plugins: {
+        legend: { display: true, labels: { color: '#8892a8', boxWidth: 12, padding: 8 } },
+        tooltip: {
+          callbacks: {
+            title: (items) => { const d = items[0]?.parsed?.x ? new Date(items[0].parsed.x) : null; return d ? d.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : ''; },
+            label: (item) => item.dataset.label + ': ' + item.formattedValue + ' ft',
+          }
+        }
+      },
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, ha' },
+          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
