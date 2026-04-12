@@ -42,15 +42,21 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-import torch
-import lightning.pytorch as pl
-from pytorch_forecasting import (
-    TemporalFusionTransformer,
-    TimeSeriesDataSet,
-    QuantileLoss,
-)
-from pytorch_forecasting.data import NaNLabelEncoder
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+# PyTorch / Lightning / pytorch-forecasting are optional (not needed for ONNX inference)
+# They are imported lazily in training functions only.
+try:
+    import torch
+    import lightning.pytorch as pl
+    from pytorch_forecasting import (
+        TemporalFusionTransformer,
+        TimeSeriesDataSet,
+        QuantileLoss,
+    )
+    from pytorch_forecasting.data import NaNLabelEncoder
+    from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
 
 # --- constants -------------------------------------------------------------
 
