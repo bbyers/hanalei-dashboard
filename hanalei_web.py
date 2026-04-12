@@ -221,9 +221,9 @@ def _run_prediction() -> dict:
     _log("[predict] computing prob history...")
 
     def _to_hst(ts):
-        """Convert UTC timestamp to HST ISO string."""
+        """Convert UTC timestamp to HST, emit as fake-UTC so Chart.js won't shift again."""
         hst = ts - timedelta(hours=10)
-        return hst.strftime("%Y-%m-%dT%H:%M:%S")
+        return hst.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Probability history: use all TFT predictions from the batch
     prob_hist = []
