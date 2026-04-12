@@ -219,6 +219,12 @@ def _run_prediction() -> dict:
             rain_1h[name] = 0.0
 
     _log("[predict] computing prob history...")
+
+    def _to_hst(ts):
+        """Convert UTC timestamp to HST ISO string."""
+        hst = ts - timedelta(hours=10)
+        return hst.strftime("%Y-%m-%dT%H:%M:%S")
+
     # Probability history: use all TFT predictions from the batch
     prob_hist = []
     n_preds = 0
@@ -233,7 +239,7 @@ def _run_prediction() -> dict:
             if gauge_at_ts >= bundle.closure_ft:
                 p = 1.0
             prob_hist.append({
-                "ts": ts.isoformat(),
+                "ts": _to_hst(ts),
                 "prob": round(float(p), 4),
             })
 
@@ -244,13 +250,13 @@ def _run_prediction() -> dict:
     gauge_hist = []
     for ts, row in hist_feats.iterrows():
         gauge_hist.append({
-            "ts": ts.isoformat(),
+            "ts": _to_hst(ts),
             "gauge_ft": round(float(row["gauge_ft"]), 2),
         })
 
     tide_hist = []
     for ts, row in hist_feats.iterrows():
-        entry = {"ts": ts.isoformat()}
+        entry = {"ts": _to_hst(ts)}
         if "tide_ft" in row.index and not pd.isna(row["tide_ft"]):
             entry["tide_ft"] = round(float(row["tide_ft"]), 2)
         if "tide_pred_ft" in row.index and not pd.isna(row["tide_pred_ft"]):
@@ -859,7 +865,7 @@ function buildProbChart(data, threshPct) {
   probChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
+      labels: data.map(d => new Date(d.ts)),
       datasets: [{
         data: data.map(d => d.prob * 100),
         borderColor: '#38bdf8',
@@ -909,7 +915,7 @@ function buildGaugeChart(data, closureFt) {
   gaugeChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
+      labels: data.map(d => new Date(d.ts)),
       datasets: [{
         data: data.map(d => d.gauge_ft),
         borderColor: '#22c55e',
@@ -958,7 +964,7 @@ function buildTideChart(data) {
   tideChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d => new Date(new Date(d.ts).getTime() - 10*3600000)),
+      labels: data.map(d => new Date(d.ts)),
       datasets: [{
         label: 'Observed',
         data: data.map(d => d.tide_ft ?? null),
