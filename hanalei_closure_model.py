@@ -655,15 +655,19 @@ def fetch_google_weather() -> pd.DataFrame | None:
             ts = pd.Timestamp(ts_str, tz="UTC")
             precip = h.get("precipitation", {})
             wind = h.get("wind", {})
+            humidity = h.get("relativeHumidity", np.nan)
+            if isinstance(humidity, dict):
+                humidity = humidity.get("value", np.nan)
+            temp = h.get("temperature", {})
+            temp_val = temp.get("degrees", temp.get("value", np.nan)) if isinstance(temp, dict) else np.nan
             records.append({
                 "ts": ts,
-                "gw_precip_rate": precip.get("probability", {}).get("value",
-                    precip.get("qpf", {}).get("quantity", {}).get("value", 0)),
-                "gw_temperature": h.get("temperature", {}).get("value", np.nan),
-                "gw_humidity": h.get("relativeHumidity", {}).get("value", np.nan),
+                "gw_precip_rate": precip.get("qpf", {}).get("quantity", 0),
+                "gw_temperature": temp_val,
+                "gw_humidity": humidity,
                 "gw_wind_speed": wind.get("speed", {}).get("value", np.nan),
                 "gw_wind_gust": wind.get("gust", {}).get("value", np.nan),
-                "gw_pressure": h.get("pressure", {}).get("meanSeaLevel", {}).get("value", np.nan),
+                "gw_pressure": h.get("barometricPressure", {}).get("value", np.nan),
             })
 
         if not records:
