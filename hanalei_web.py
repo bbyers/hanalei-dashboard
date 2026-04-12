@@ -21,7 +21,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import torch
+import onnxruntime as ort
 from flask import Flask, jsonify, render_template_string
 
 print("[startup] importing hanalei_closure_model...", file=sys.stderr, flush=True)
@@ -32,6 +32,8 @@ try:
         TIMESTEP_MIN,
         TFTBundle,
         TFT_QUANTILES,
+        TFT_OBSERVED_COLS,
+        TFT_KNOWN_COLS,
         build_tft_features,
         fetch_all_rain_recent,
         fetch_bridge_gauge_recent,
@@ -45,13 +47,10 @@ try:
         fetch_weather_recent,
         load_tft_bundle,
         prepare_tft_dataframe,
-        build_tft_dataset,
         quantiles_to_closure_prob,
-        tft_predict_quantiles,
         to_hourly,
         _rain_col,
     )
-    from pytorch_forecasting import TemporalFusionTransformer
     # Legacy alias
     TrainBundle = TFTBundle
     build_features = build_tft_features
@@ -68,7 +67,7 @@ except Exception as e:
 app = Flask(__name__)
 
 _bundle: TFTBundle | None = None
-_tft_model: TemporalFusionTransformer | None = None
+_onnx_session: ort.InferenceSession | None = None
 _calibrator = None
 _latest: dict = {"status": "loading", "message": "Fetching initial data..."}
 _history: list[dict] = []          # last 72 hours of predictions
@@ -86,10 +85,92 @@ def _log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def _build_onnx_inputs(prep: pd.DataFrame, encoder_length: int, prediction_length: int) -> list[dict]:
+    """Build ONNX input dicts from prepared dataframe (replaces TimeSeriesDataSet).
+
+    Creates sliding windows over the dataframe, each with:
+    - encoder_cont: (encoder_length, n_features) continuous encoder features
+    - decoder_cont: (prediction_length, n_features) continuous decoder features
+    - encoder_lengths: scalar encoder length
+    - decoder_lengths: scalar decoder length
+    - target_scale: (2,) [center, scale] for the target (mean, 1.0)
+    """
+    observed_cols = [c for c in TFT_OBSERVED_COLS if c in prep.columns]
+    known_cols = [c for c in TFT_KNOWN_COLS if c in prep.columns]
+    # All continuous columns in the same order as training
+    # encoder_cont includes: target + observed + known + relative_time_idx + encoder_length + target_scale(2)
+    # But ONNX traced with 40 features — let's match exactly
+
+    # The 40 encoder_cont features are: gauge_ft (target) + observed_cols + known_cols + relative_time_idx + encoder_length + target_scale_center + target_scale_scale
+    # Let me build them to match the training data structure
+    target_col = "gauge_ft"
+    all_cont_cols = [target_col] + [c for c in observed_cols if c != target_col] + known_cols
+
+    windows = []
+    total_len = encoder_length + prediction_length
+    n_windows = len(prep) - total_len + 1
+    if n_windows <= 0:
+        return []
+
+    vals = prep[all_cont_cols].values.astype(np.float32)
+    target_vals = prep[target_col].values.astype(np.float32)
+    target_mean = float(np.nanmean(target_vals))
+
+    for i in range(max(0, n_windows - 48 * 4), n_windows):  # last 48h of windows
+        enc_start = i
+        enc_end = i + encoder_length
+        dec_end = enc_end + prediction_length
+
+        enc_data = vals[enc_start:enc_end]
+        dec_data = vals[enc_end:dec_end]
+
+        # Add relative_time_idx, encoder_length, target_scale columns
+        enc_rel_idx = np.arange(-encoder_length, 0, dtype=np.float32).reshape(-1, 1)
+        dec_rel_idx = np.arange(0, prediction_length, dtype=np.float32).reshape(-1, 1)
+
+        enc_len_col = np.full((encoder_length, 1), encoder_length, dtype=np.float32)
+        dec_len_col = np.full((prediction_length, 1), encoder_length, dtype=np.float32)
+
+        enc_scale_center = np.full((encoder_length, 1), target_mean, dtype=np.float32)
+        dec_scale_center = np.full((prediction_length, 1), target_mean, dtype=np.float32)
+        enc_scale_scale = np.full((encoder_length, 1), 1.0, dtype=np.float32)
+        dec_scale_scale = np.full((prediction_length, 1), 1.0, dtype=np.float32)
+
+        enc_cont = np.concatenate([enc_data, enc_rel_idx, enc_len_col, enc_scale_center, enc_scale_scale], axis=1)
+        dec_cont = np.concatenate([dec_data, dec_rel_idx, dec_len_col, dec_scale_center, dec_scale_scale], axis=1)
+
+        windows.append({
+            "encoder_cont": enc_cont,
+            "decoder_cont": dec_cont,
+            "encoder_lengths": np.int64(encoder_length),
+            "decoder_lengths": np.int64(prediction_length),
+            "target_scale": np.array([target_mean, 1.0], dtype=np.float32),
+        })
+    return windows
+
+
+def _onnx_predict_quantiles(session: ort.InferenceSession, windows: list[dict],
+                             batch_size: int = 32) -> np.ndarray:
+    """Run ONNX inference on windows, return (n_windows, prediction_length, n_quantiles)."""
+    all_preds = []
+    for start in range(0, len(windows), batch_size):
+        batch = windows[start:start + batch_size]
+        feed = {
+            "encoder_cont": np.stack([w["encoder_cont"] for w in batch]),
+            "decoder_cont": np.stack([w["decoder_cont"] for w in batch]),
+            "encoder_lengths": np.array([w["encoder_lengths"] for w in batch]),
+            "decoder_lengths": np.array([w["decoder_lengths"] for w in batch]),
+            "target_scale": np.stack([w["target_scale"] for w in batch]),
+        }
+        pred = session.run(None, feed)[0]
+        all_preds.append(pred)
+    return np.concatenate(all_preds, axis=0)
+
+
 def _run_prediction() -> dict:
-    """Run one prediction cycle using TFT, return result dict."""
+    """Run one prediction cycle using ONNX TFT, return result dict."""
     bundle = _bundle
-    model = _tft_model
+    session = _onnx_session
     calibrator = _calibrator
 
     _log("[predict] fetching gauge...")
@@ -182,15 +263,15 @@ def _run_prediction() -> dict:
         prep = prep.iloc[-min_rows * 2:]
         prep["time_idx"] = np.arange(len(prep))
 
-    pred_dataset = build_tft_dataset(
-        prep, encoder_length=bundle.encoder_length,
-        prediction_length=bundle.prediction_length, training=True,
-    )
+    _log("[predict] building ONNX input windows...")
+    windows = _build_onnx_inputs(prep, bundle.encoder_length, bundle.prediction_length)
+    if len(windows) == 0:
+        return {"status": "error", "message": "Could not build prediction windows"}
 
-    _log("[predict] running TFT inference...")
-    preds = tft_predict_quantiles(model, pred_dataset)
+    _log(f"[predict] running ONNX inference on {len(windows)} windows...")
+    preds = _onnx_predict_quantiles(session, windows)
     if len(preds) == 0:
-        return {"status": "error", "message": "TFT produced no predictions"}
+        return {"status": "error", "message": "ONNX produced no predictions"}
 
     # Latest prediction
     last_pred = preds[-1:]
@@ -1109,8 +1190,8 @@ initialPoll();
 # ---------------------------------------------------------------------------
 
 def _init_model_and_thread(model_path: str):
-    """Load the TFT model and start the background prediction thread."""
-    global _bundle, _tft_model, _calibrator
+    """Load the ONNX TFT model and start the background prediction thread."""
+    global _bundle, _onnx_session, _calibrator
     model_dir = Path(model_path)
     if model_dir.is_file():
         model_dir = model_dir.parent
@@ -1124,27 +1205,15 @@ def _init_model_and_thread(model_path: str):
     else:
         raise FileNotFoundError(f"bundle.json not found in {model_dir}")
 
-    # Load TFT checkpoint (CPU-only: patch torch.zeros for torchmetrics CUDA device refs)
-    ckpt_path = model_dir / "tft_model_cpu.ckpt"
-    if not ckpt_path.exists():
-        ckpt_path = model_dir / "tft_model.ckpt"
-    if ckpt_path.exists():
-        _orig_zeros = torch.zeros
-        def _patched_zeros(*args, **kwargs):
-            if 'device' in kwargs and kwargs['device'] is not None:
-                dev = kwargs['device']
-                if (isinstance(dev, torch.device) and dev.type == 'cuda') or \
-                   (isinstance(dev, str) and 'cuda' in dev):
-                    kwargs['device'] = torch.device('cpu')
-            return _orig_zeros(*args, **kwargs)
-        torch.zeros = _patched_zeros
-        _tft_model = TemporalFusionTransformer.load_from_checkpoint(
-            str(ckpt_path), map_location="cpu",
-        )
-        torch.zeros = _orig_zeros
-        _tft_model.eval()
+    # Load ONNX model
+    onnx_path = model_dir / "tft_model.onnx"
+    if onnx_path.exists():
+        _onnx_session = ort.InferenceSession(str(onnx_path))
+        print(f"  ONNX model loaded: {onnx_path} "
+              f"({onnx_path.stat().st_size / 1e6:.1f} MB)",
+              file=sys.stderr, flush=True)
     else:
-        raise FileNotFoundError(f"tft_model_cpu.ckpt not found in {model_dir}")
+        raise FileNotFoundError(f"tft_model.onnx not found in {model_dir}")
 
     # Load calibrator
     cal_path = model_dir / "calibrator.joblib"
@@ -1152,7 +1221,7 @@ def _init_model_and_thread(model_path: str):
         _calibrator = joblib.load(cal_path)
 
     print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
-          f"encoder: {_bundle.encoder_length}, params: {sum(p.numel() for p in _tft_model.parameters()):,}",
+          f"encoder: {_bundle.encoder_length}",
           file=sys.stderr, flush=True)
 
     t = threading.Thread(target=_prediction_loop, daemon=True)
