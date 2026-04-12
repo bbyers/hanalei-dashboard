@@ -251,6 +251,10 @@ def _run_prediction() -> dict:
         n_preds = len(all_probs)
         pred_feats = feats.iloc[-n_preds:]
         for ts, p in zip(pred_feats.index, all_probs):
+            # If gauge is already above closure threshold, prob = 100%
+            gauge_at_ts = float(pred_feats.loc[ts, "gauge_ft"])
+            if gauge_at_ts >= bundle.closure_ft:
+                p = 1.0
             prob_hist.append({
                 "ts": ts.isoformat(),
                 "prob": round(float(p), 4),
