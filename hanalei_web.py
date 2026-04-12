@@ -218,19 +218,38 @@ def _run_prediction() -> dict:
             rain_6h[name] = 0.0
             rain_1h[name] = 0.0
 
+    _log("[predict] computing prob history...")
+    # Probability history: use all TFT predictions from the batch
+    prob_hist = []
+    n_preds = 0
+    if len(preds) > 1:
+        all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
+        if calibrator:
+            all_probs = calibrator.predict(all_probs)
+        n_preds = len(all_probs)
+        pred_feats = feats.iloc[-n_preds:]
+        for ts, p in zip(pred_feats.index, all_probs):
+            gauge_at_ts = float(pred_feats.loc[ts, "gauge_ft"])
+            if gauge_at_ts >= bundle.closure_ft:
+                p = 1.0
+            prob_hist.append({
+                "ts": ts.isoformat(),
+                "prob": round(float(p), 4),
+            })
+
     _log("[predict] building history arrays...")
-    # Gauge history for sparkline (last 5 days)
+    # Use same time range as prob history for gauge and tide (all charts aligned)
+    hist_feats = feats.iloc[-n_preds:] if n_preds > 0 else feats.tail(5 * 24 * S)
+
     gauge_hist = []
-    last_48 = feats.tail(5 * 24 * S)
-    for ts, row in last_48.iterrows():
+    for ts, row in hist_feats.iterrows():
         gauge_hist.append({
             "ts": ts.isoformat(),
             "gauge_ft": round(float(row["gauge_ft"]), 2),
         })
 
-    # Tide history (last 5 days)
     tide_hist = []
-    for ts, row in last_48.iterrows():
+    for ts, row in hist_feats.iterrows():
         entry = {"ts": ts.isoformat()}
         if "tide_ft" in row.index and not pd.isna(row["tide_ft"]):
             entry["tide_ft"] = round(float(row["tide_ft"]), 2)
@@ -239,26 +258,6 @@ def _run_prediction() -> dict:
         if "storm_surge_ft" in row.index and not pd.isna(row["storm_surge_ft"]):
             entry["surge_ft"] = round(float(row["storm_surge_ft"]), 2)
         tide_hist.append(entry)
-
-    _log("[predict] computing prob history...")
-    # Probability history: use all TFT predictions from the batch
-    prob_hist = []
-    if len(preds) > 1:
-        all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
-        if calibrator:
-            all_probs = calibrator.predict(all_probs)
-        # Align with feats timestamps (predictions correspond to tail of dataset)
-        n_preds = len(all_probs)
-        pred_feats = feats.iloc[-n_preds:]
-        for ts, p in zip(pred_feats.index, all_probs):
-            # If gauge is already above closure threshold, prob = 100%
-            gauge_at_ts = float(pred_feats.loc[ts, "gauge_ft"])
-            if gauge_at_ts >= bundle.closure_ft:
-                p = 1.0
-            prob_hist.append({
-                "ts": ts.isoformat(),
-                "prob": round(float(p), 4),
-            })
 
     # Discharge
     latest_row = feats.iloc[-1]
