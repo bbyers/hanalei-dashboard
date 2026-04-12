@@ -225,18 +225,32 @@ def _run_prediction() -> dict:
         hst = ts - timedelta(hours=10)
         return hst.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Probability history: use all TFT predictions from the batch
-    prob_hist = []
-    n_preds = 0
+    # Build prob lookup: map prep time_idx -> probability
+    # Use decoder_time_idx from dataset to get the actual time each prediction corresponds to
+    prob_by_tidx = {}
     if len(preds) > 1:
         all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
         if calibrator:
             all_probs = calibrator.predict(all_probs)
-        n_preds = len(all_probs)
+        # Get the decoder_time_idx for each prediction to know its actual position
+        dl_for_idx = pred_dataset.to_dataloader(train=False, batch_size=256, num_workers=0)
+        pred_i = 0
+        for x_batch, _ in dl_for_idx:
+            dec_tidx = x_batch["decoder_time_idx"].numpy()  # (batch, pred_len)
+            enc_lens = x_batch["encoder_lengths"].numpy()   # (batch,)
+            for j in range(len(enc_lens)):
+                # "current time" = last encoder step = decoder_time_idx[j,0] - 1
+                current_tidx = int(dec_tidx[j, 0]) - 1
+                if 0 <= current_tidx < len(prep) and pred_i < len(all_probs):
+                    prob_by_tidx[current_tidx] = float(all_probs[pred_i])
+                pred_i += 1
+        _log(f"[predict] mapped {len(prob_by_tidx)} predictions to time indices")
 
     _log("[predict] building history arrays...")
     # Use last 5 days of feats for all charts
     hist_feats = feats.tail(5 * 24 * S)
+    # Map feats index to prep time_idx
+    prep_start_in_feats = len(feats) - len(prep)
 
     gauge_hist = []
     prob_hist = []
@@ -248,21 +262,14 @@ def _run_prediction() -> dict:
         # Gauge
         gauge_hist.append({"ts": hst_ts, "gauge_ft": gauge_val})
 
-        # Prob: if gauge >= closure, P=100%; else use model prediction if available
+        # Prob: if gauge >= closure, P=100%; else use model prediction
         if gauge_val >= bundle.closure_ft:
             prob_hist.append({"ts": hst_ts, "prob": 1.0})
-        elif n_preds > 0:
-            # Map this hist_feats row to the corresponding prediction index
-            # hist_feats starts at feats.iloc[-len(hist_feats)]
-            # preds covers feats.iloc[-n_preds:] (last n_preds rows of feats)
-            feats_idx = len(feats) - len(hist_feats) + i
-            pred_idx = feats_idx - (len(feats) - n_preds)
-            if 0 <= pred_idx < n_preds:
-                prob_hist.append({"ts": hst_ts, "prob": round(float(all_probs[pred_idx]), 4)})
-            else:
-                prob_hist.append({"ts": hst_ts, "prob": 0.0})
         else:
-            prob_hist.append({"ts": hst_ts, "prob": 0.0})
+            feats_idx = len(feats) - len(hist_feats) + i
+            tidx = feats_idx - prep_start_in_feats
+            p = prob_by_tidx.get(tidx, 0.0)
+            prob_hist.append({"ts": hst_ts, "prob": round(p, 4)})
 
         # Tide
         entry = {"ts": hst_ts}
