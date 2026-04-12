@@ -397,6 +397,28 @@ def api_history():
         return jsonify(_history)
 
 
+@app.route("/api/preview")
+def api_preview():
+    """Serve 3-month backtest data from preview_3mo.json."""
+    # Search in app directory and working directory
+    for p in [Path(__file__).parent / "preview_3mo.json", Path("preview_3mo.json")]:
+        if p.exists():
+            return jsonify(json.loads(p.read_text()))
+    return jsonify({"status": "error", "message": "preview_3mo.json not found"})
+
+
+@app.route("/preview")
+def preview():
+    """3-month backtest view — uses static precomputed data."""
+    return render_template_string(HTML_TEMPLATE.replace(
+        "'/api/predict'", "'/api/preview'"
+    ).replace(
+        "Last 5 Days", "Last 3 Months"
+    ).replace(
+        "Refreshes every 5 min", "3-Month Backtest (static)"
+    ))
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -635,6 +657,13 @@ HTML_TEMPLATE = r"""
     padding: 14px;
     margin-bottom: 12px;
   }
+  .tl-btn {
+    background: rgba(30,45,74,0.6); border: 1px solid rgba(56,189,248,0.3);
+    color: #8892a8; padding: 3px 10px; border-radius: 4px; cursor: pointer;
+    font-size: 0.75rem; font-weight: 600; transition: all 0.2s;
+  }
+  .tl-btn:hover { border-color: #38bdf8; color: #e2e8f0; }
+  .tl-btn.active { background: rgba(56,189,248,0.2); border-color: #38bdf8; color: #38bdf8; }
   .chart-card .chart-title {
     font-size: 0.8rem;
     color: var(--text-dim);
@@ -808,15 +837,23 @@ function renderDashboard(d) {
 
     <div class="chart-section">
       <div class="chart-card">
-        <div class="chart-title">Closure Probability — Last 5 Days</div>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+          <div class="chart-title" style="margin:0">Charts</div>
+          <div id="timelineSelector" style="display:flex; gap:4px;">
+            <button class="tl-btn" data-hours="12" onclick="setTimeline(12)">12h</button>
+            <button class="tl-btn" data-hours="48" onclick="setTimeline(48)">48h</button>
+            <button class="tl-btn active" data-hours="120" onclick="setTimeline(120)">5d</button>
+          </div>
+        </div>
+        <div class="chart-title">Closure Probability — <span id="probTitle">Last 5 Days</span></div>
         <div style="position:relative; height:200px;"><canvas id="probChart"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-title">Gauge Height — Last 5 Days</div>
+        <div class="chart-title">Gauge Height — <span id="gaugeTitle">Last 5 Days</span></div>
         <div style="position:relative; height:200px;"><canvas id="gaugeChart"></canvas></div>
       </div>
       <div class="chart-card">
-        <div class="chart-title">Tide Level — Last 5 Days</div>
+        <div class="chart-title">Tide Level — <span id="tideTitle">Last 5 Days</span></div>
         <div style="position:relative; height:200px;"><canvas id="tideChart"></canvas></div>
       </div>
       <div class="chart-card">
@@ -868,10 +905,41 @@ function renderDashboard(d) {
       </tr>`;
   }
 
-  // Charts
-  buildProbChart(d.prob_history || [], d.model_threshold_pct);
-  buildGaugeChart(d.gauge_history || [], d.closure_ft);
-  buildTideChart(d.tide_history || []);
+  // Store full data for timeline filtering
+  window._chartData = {
+    prob: d.prob_history || [],
+    gauge: d.gauge_history || [],
+    tide: d.tide_history || [],
+    threshPct: d.model_threshold_pct,
+    closureFt: d.closure_ft,
+  };
+  rebuildCharts();
+}
+
+let _timelineHours = 120; // default 5 days
+
+function setTimeline(hours) {
+  _timelineHours = hours;
+  document.querySelectorAll('.tl-btn').forEach(b => b.classList.toggle('active', parseInt(b.dataset.hours) === hours));
+  const label = hours <= 12 ? 'Last 12 Hours' : hours <= 48 ? 'Last 48 Hours' : 'Last 5 Days';
+  document.getElementById('probTitle').textContent = label;
+  document.getElementById('gaugeTitle').textContent = label;
+  document.getElementById('tideTitle').textContent = label;
+  rebuildCharts();
+}
+
+function filterByTimeline(data) {
+  if (!data || !data.length) return data;
+  const cutoff = new Date(new Date(data[data.length - 1].ts).getTime() - _timelineHours * 3600000);
+  return data.filter(d => new Date(d.ts) >= cutoff);
+}
+
+function rebuildCharts() {
+  if (!window._chartData) return;
+  const cd = window._chartData;
+  buildProbChart(filterByTimeline(cd.prob), cd.threshPct);
+  buildGaugeChart(filterByTimeline(cd.gauge), cd.closureFt);
+  buildTideChart(filterByTimeline(cd.tide));
 }
 
 function buildProbChart(data, threshPct) {
@@ -915,7 +983,7 @@ function buildProbChart(data, threshPct) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
+          time: { displayFormats: { day: 'MMM d', week: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
@@ -976,7 +1044,7 @@ function buildGaugeChart(data, closureFt) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
+          time: { displayFormats: { day: 'MMM d', week: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
@@ -1044,7 +1112,7 @@ function buildTideChart(data) {
       scales: {
         x: {
           type: 'time',
-          time: { unit: 'day', displayFormats: { day: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
+          time: { displayFormats: { day: 'MMM d', week: 'MMM d', hour: 'ha' }, tooltipFormat: 'MMM d, h:mm a' },
           grid: { color: 'rgba(30,45,74,0.5)' },
           ticks: { color: '#8892a8', maxTicksLimit: 6 },
         },
