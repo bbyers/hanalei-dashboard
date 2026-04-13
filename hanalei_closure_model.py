@@ -42,21 +42,15 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-# PyTorch / Lightning / pytorch-forecasting are optional (not needed for ONNX inference)
-# They are imported lazily in training functions only.
-try:
-    import torch
-    import lightning.pytorch as pl
-    from pytorch_forecasting import (
-        TemporalFusionTransformer,
-        TimeSeriesDataSet,
-        QuantileLoss,
-    )
-    from pytorch_forecasting.data import NaNLabelEncoder
-    from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
-    _HAS_TORCH = True
-except ImportError:
-    _HAS_TORCH = False
+import torch
+import lightning.pytorch as pl
+from pytorch_forecasting import (
+    TemporalFusionTransformer,
+    TimeSeriesDataSet,
+    QuantileLoss,
+)
+from pytorch_forecasting.data import NaNLabelEncoder
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 
 # --- constants -------------------------------------------------------------
 
@@ -113,6 +107,15 @@ OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 HANALEI_LAT = 22.198
 HANALEI_LON = -159.467
 
+# Catchment points for Google Weather multi-point forecasting.
+# Hanalei River floods are driven by orographic rainfall on the upper watershed.
+CATCHMENT_POINTS = {
+    "bridge":    (22.198, -159.467),  # river mouth / bridge (existing point)
+    "valley":    (22.180, -159.470),  # valley floor
+    "kilohana":  (22.155, -159.400),  # mid-catchment (near Kilohana rain gauge)
+    "waialeale": (22.065, -159.499),  # Mt Waialeale summit — wettest spot, headwaters
+}
+
 CLOSURE_FT = 5.0
 HORIZON_H = 3
 TIMESTEP_MIN = 15           # 15-minute resolution (v6)
@@ -157,12 +160,18 @@ TFT_KNOWN_COLS = [
     "nws_qpf_3h", "nws_qpf_6h",
     "gw_precip_rate", "gw_temperature", "gw_humidity",
     "gw_wind_speed", "gw_wind_gust", "gw_pressure",
+    # Catchment-specific precipitation forecasts (mountain points)
+    "gw_precip_valley", "gw_precip_kilohana", "gw_precip_waialeale",
+    "gw_precip_max",      # max precip across all catchment points
     "has_nws_forecast", "has_google_weather",
 ]
 
-# Google Weather API columns
+# Google Weather API columns (bridge point — backward compatible)
 GW_COLS = ["gw_precip_rate", "gw_temperature", "gw_humidity",
            "gw_wind_speed", "gw_wind_gust", "gw_pressure"]
+# Catchment precip columns
+GW_CATCHMENT_COLS = ["gw_precip_valley", "gw_precip_kilohana",
+                     "gw_precip_waialeale", "gw_precip_max"]
 
 # Legacy alias for backward compat (web module may reference)
 FEATURE_COLUMNS = TFT_OBSERVED_COLS + TFT_KNOWN_COLS
@@ -622,63 +631,113 @@ def fetch_nws_forecast() -> dict[str, pd.DataFrame]:
 
 # --- Google Weather API (WeatherNext 2) ------------------------------------
 
-def fetch_google_weather() -> pd.DataFrame | None:
-    """Fetch hourly forecast from Google Weather API for Hanalei.
+def _fetch_gw_point(lat: float, lon: float, label: str) -> pd.DataFrame | None:
+    """Fetch hourly forecast from Google Weather API for a single point."""
+    params = {
+        "key": GOOGLE_WEATHER_API_KEY,
+        "location.latitude": lat,
+        "location.longitude": lon,
+    }
+    r = requests.get(GOOGLE_WEATHER_URL, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    hours = data.get("forecastHours", data.get("hours", []))
+    if not hours:
+        return None
+    records = []
+    for h in hours:
+        ts_str = h.get("interval", {}).get("startTime") or h.get("startTime")
+        if not ts_str:
+            continue
+        ts = pd.Timestamp(ts_str, tz="UTC")
+        precip = h.get("precipitation", {})
+        wind = h.get("wind", {})
+        records.append({
+            "ts": ts,
+            "precip": precip.get("qpf", {}).get("quantity", 0),
+            "temperature": h.get("temperature", {}).get("degrees", np.nan) if isinstance(h.get("temperature"), dict) else np.nan,
+            "humidity": h.get("relativeHumidity", np.nan) if not isinstance(h.get("relativeHumidity"), dict) else h.get("relativeHumidity", {}).get("value", np.nan),
+            "wind_speed": wind.get("speed", {}).get("value", np.nan),
+            "wind_gust": wind.get("gust", {}).get("value", np.nan),
+            "pressure": h.get("barometricPressure", {}).get("value", np.nan),
+        })
+    if not records:
+        return None
+    df = pd.DataFrame(records)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.drop_duplicates("ts").sort_values("ts").set_index("ts")
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
-    Returns DataFrame with columns: gw_precip_rate, gw_temperature,
-    gw_humidity, gw_wind_speed, gw_wind_gust, gw_pressure.
-    Returns None on failure (graceful degradation).
+
+def fetch_google_weather() -> pd.DataFrame | None:
+    """Fetch hourly forecast from Google Weather API for Hanalei catchment.
+
+    Queries multiple points across the watershed (bridge, valley, mid-catchment,
+    Mt Waialeale summit) to capture orographic rainfall that drives flooding.
+
+    Returns DataFrame with columns:
+      gw_precip_rate, gw_temperature, gw_humidity, gw_wind_speed, gw_wind_gust,
+      gw_pressure (from bridge point — backward compatible),
+      gw_precip_valley, gw_precip_kilohana, gw_precip_waialeale (catchment points),
+      gw_precip_max (max across all points).
     """
     if not GOOGLE_WEATHER_API_KEY:
         print("  google/weather SKIPPED (no API key)", file=sys.stderr)
         return None
     try:
-        print("  google/weather fetching...", file=sys.stderr)
-        params = {
-            "key": GOOGLE_WEATHER_API_KEY,
-            "location.latitude": HANALEI_LAT,
-            "location.longitude": HANALEI_LON,
-        }
-        r = requests.get(GOOGLE_WEATHER_URL, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        hours = data.get("forecastHours", data.get("hours", []))
-        if not hours:
-            print("  google/weather no forecast hours returned", file=sys.stderr)
+        print("  google/weather fetching catchment points...", file=sys.stderr)
+        point_dfs = {}
+        for name, (lat, lon) in CATCHMENT_POINTS.items():
+            try:
+                df = _fetch_gw_point(lat, lon, name)
+                if df is not None:
+                    point_dfs[name] = df
+                    print(f"    {name}: {len(df)} hours, precip max={df['precip'].max():.1f}mm", file=sys.stderr)
+            except Exception as e:
+                print(f"    {name}: FAILED ({e})", file=sys.stderr)
+
+        if not point_dfs:
+            print("  google/weather no points returned data", file=sys.stderr)
             return None
 
-        records = []
-        for h in hours:
-            ts_str = h.get("interval", {}).get("startTime") or h.get("startTime")
-            if not ts_str:
-                continue
-            ts = pd.Timestamp(ts_str, tz="UTC")
-            precip = h.get("precipitation", {})
-            wind = h.get("wind", {})
-            humidity = h.get("relativeHumidity", np.nan)
-            if isinstance(humidity, dict):
-                humidity = humidity.get("value", np.nan)
-            temp = h.get("temperature", {})
-            temp_val = temp.get("degrees", temp.get("value", np.nan)) if isinstance(temp, dict) else np.nan
-            records.append({
-                "ts": ts,
-                "gw_precip_rate": precip.get("qpf", {}).get("quantity", 0),
-                "gw_temperature": temp_val,
-                "gw_humidity": humidity,
-                "gw_wind_speed": wind.get("speed", {}).get("value", np.nan),
-                "gw_wind_gust": wind.get("gust", {}).get("value", np.nan),
-                "gw_pressure": h.get("barometricPressure", {}).get("value", np.nan),
-            })
+        # Build output DataFrame — bridge point provides base weather columns
+        bridge = point_dfs.get("bridge")
+        if bridge is None:
+            # Fall back to first available point
+            bridge = next(iter(point_dfs.values()))
 
-        if not records:
-            return None
-        df = pd.DataFrame(records)
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        df = df.drop_duplicates("ts").sort_values("ts").set_index("ts")
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        print(f"  google/weather {len(df)} hourly forecast rows", file=sys.stderr)
-        return df
+        result = pd.DataFrame(index=bridge.index)
+        # Base columns from bridge (backward compatible)
+        result["gw_precip_rate"] = bridge["precip"]
+        result["gw_temperature"] = bridge["temperature"]
+        result["gw_humidity"] = bridge["humidity"]
+        result["gw_wind_speed"] = bridge["wind_speed"]
+        result["gw_wind_gust"] = bridge["wind_gust"]
+        result["gw_pressure"] = bridge["pressure"]
+
+        # Catchment-specific precipitation
+        for name in ["valley", "kilohana", "waialeale"]:
+            col = f"gw_precip_{name}"
+            if name in point_dfs:
+                # Align to bridge index
+                result[col] = point_dfs[name]["precip"].reindex(result.index)
+            else:
+                result[col] = np.nan
+
+        # Max precip across all catchment points (key flood signal)
+        precip_cols = [result["gw_precip_rate"]]
+        for name in ["valley", "kilohana", "waialeale"]:
+            col = f"gw_precip_{name}"
+            if col in result.columns:
+                precip_cols.append(result[col])
+        result["gw_precip_max"] = pd.concat(precip_cols, axis=1).max(axis=1)
+
+        print(f"  google/weather {len(result)} hours, {len(point_dfs)} catchment points, "
+              f"max precip={result['gw_precip_max'].max():.1f}mm (waialeale={result.get('gw_precip_waialeale', pd.Series([0])).max():.1f}mm)",
+              file=sys.stderr)
+        return result
     except Exception as e:
         print(f"  google/weather FAILED: {e}", file=sys.stderr)
         return None
@@ -840,7 +899,7 @@ def build_tft_features(df: pd.DataFrame) -> pd.DataFrame:
     out["has_google_weather"] = 1.0 if has_gw else 0.0
 
     # --- ensure all Google Weather columns exist ---
-    for col in GW_COLS:
+    for col in GW_COLS + GW_CATCHMENT_COLS:
         if col not in out.columns:
             out[col] = 0.0
 
