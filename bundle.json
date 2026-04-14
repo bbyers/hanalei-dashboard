@@ -39,6 +39,10 @@
     "gw_wind_speed",
     "gw_wind_gust",
     "gw_pressure",
+    "gw_precip_valley",
+    "gw_precip_kilohana",
+    "gw_precip_waialeale",
+    "gw_precip_max",
     "has_nws_forecast",
     "has_google_weather"
   ],
@@ -99,6 +103,10 @@
     "gw_wind_speed": 0.0,
     "gw_wind_gust": 0.0,
     "gw_pressure": 0.0,
+    "gw_precip_valley": 0.0,
+    "gw_precip_kilohana": 0.0,
+    "gw_precip_waialeale": 0.0,
+    "gw_precip_max": 0.0,
     "has_nws_forecast": 0.0,
     "has_google_weather": 0.0
   }
