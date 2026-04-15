@@ -193,16 +193,44 @@ def _run_prediction() -> dict:
     if len(preds) == 0:
         return {"status": "error", "message": "TFT produced no predictions"}
 
-    # Latest prediction
-    last_pred = preds[-1:]
-    raw_prob = float(quantiles_to_closure_prob(last_pred, bundle.quantiles)[0])
-    prob = float(calibrator.predict([raw_prob])[0]) if calibrator else raw_prob
+    # Build a time-indexed lookup of all predictions. The TFT dataloader does
+    # NOT return predictions in chronological order, so preds[-1] is whichever
+    # batch happened to be processed last — not the latest forecast in time.
+    # We must use decoder_time_idx to map predictions to actual time positions.
+    all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
+    if calibrator:
+        all_probs = calibrator.predict(all_probs)
+    prob_by_tidx = {}
+    dl_for_idx = pred_dataset.to_dataloader(train=False, batch_size=256, num_workers=0)
+    pred_i = 0
+    for x_batch, _ in dl_for_idx:
+        dec_tidx = x_batch["decoder_time_idx"].numpy()  # (batch, pred_len)
+        enc_lens = x_batch["encoder_lengths"].numpy()   # (batch,)
+        for j in range(len(enc_lens)):
+            # "current time" = last encoder step = decoder_time_idx[j,0] - 1
+            current_tidx = int(dec_tidx[j, 0]) - 1
+            if 0 <= current_tidx < len(prep) and pred_i < len(all_probs):
+                prob_by_tidx[current_tidx] = float(all_probs[pred_i])
+            pred_i += 1
+    _log(f"[predict] mapped {len(prob_by_tidx)} predictions to time indices")
+
+    # Latest prediction = the one whose "current time" is the last row of prep.
+    # This guarantees the header value matches the last point on the chart.
+    latest_tidx = len(prep) - 1
+    prob = prob_by_tidx.get(latest_tidx)
+    if prob is None:
+        # Fall back to the highest available time index
+        if prob_by_tidx:
+            latest_tidx = max(prob_by_tidx.keys())
+            prob = prob_by_tidx[latest_tidx]
+        else:
+            return {"status": "error", "message": "No prediction available for current time"}
 
     gauge_now = float(feats["gauge_ft"].iloc[-1])
     already_above = bool(gauge_now >= bundle.closure_ft)
     if already_above:
         prob = 1.0
-    _log(f"[predict] DONE — raw={raw_prob:.4f}, calibrated={prob:.4f}, above={already_above}")
+    _log(f"[predict] DONE — calibrated={prob:.4f}, above={already_above}, latest_tidx={latest_tidx}")
     alert = bool(prob >= bundle.threshold)
 
     # Rain totals (compute from raw 15-min data)
@@ -224,27 +252,6 @@ def _run_prediction() -> dict:
         """Convert UTC timestamp to HST as naive string (no timezone suffix)."""
         hst = ts - timedelta(hours=10)
         return hst.strftime("%Y-%m-%dT%H:%M:%S")
-
-    # Build prob lookup: map prep time_idx -> probability
-    # Use decoder_time_idx from dataset to get the actual time each prediction corresponds to
-    prob_by_tidx = {}
-    if len(preds) > 1:
-        all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
-        if calibrator:
-            all_probs = calibrator.predict(all_probs)
-        # Get the decoder_time_idx for each prediction to know its actual position
-        dl_for_idx = pred_dataset.to_dataloader(train=False, batch_size=256, num_workers=0)
-        pred_i = 0
-        for x_batch, _ in dl_for_idx:
-            dec_tidx = x_batch["decoder_time_idx"].numpy()  # (batch, pred_len)
-            enc_lens = x_batch["encoder_lengths"].numpy()   # (batch,)
-            for j in range(len(enc_lens)):
-                # "current time" = last encoder step = decoder_time_idx[j,0] - 1
-                current_tidx = int(dec_tidx[j, 0]) - 1
-                if 0 <= current_tidx < len(prep) and pred_i < len(all_probs):
-                    prob_by_tidx[current_tidx] = float(all_probs[pred_i])
-                pred_i += 1
-        _log(f"[predict] mapped {len(prob_by_tidx)} predictions to time indices")
 
     _log("[predict] building history arrays...")
     # Use last 5 days of feats for all charts
