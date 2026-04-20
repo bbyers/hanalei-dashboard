@@ -239,6 +239,7 @@ def _run_prediction() -> dict:
     rain_6h = {}
     rain_24h = {}
     rain_7d = {}
+    rain_24h_series = {}  # last 24 hourly totals per gauge for sparkline
     for name, _ in RAIN_GAUGES:
         col = _rain_col(name)
         if col in feats.columns:
@@ -247,11 +248,19 @@ def _run_prediction() -> dict:
             rain_6h[name] = round(float(series.iloc[-6*S:].sum()), 2)
             rain_24h[name] = round(float(series.iloc[-24*S:].sum()), 2)
             rain_7d[name] = round(float(series.iloc[-7*24*S:].sum()), 2)
+            # 24 hourly totals, newest-last
+            last_24h = series.iloc[-24*S:]
+            if len(last_24h) >= S:
+                hourly = last_24h.resample("1h").sum()
+                rain_24h_series[name] = [round(float(v), 3) for v in hourly.tail(24).tolist()]
+            else:
+                rain_24h_series[name] = []
         else:
             rain_1h[name] = 0.0
             rain_6h[name] = 0.0
             rain_24h[name] = 0.0
             rain_7d[name] = 0.0
+            rain_24h_series[name] = []
 
     _log("[predict] computing prob history...")
 
@@ -325,6 +334,7 @@ def _run_prediction() -> dict:
         "rain_6h": rain_6h,
         "rain_24h": rain_24h,
         "rain_7d": rain_7d,
+        "rain_24h_series": rain_24h_series,
         "gauge_history": gauge_hist,
         "tide_history": tide_hist,
         "prob_history": prob_hist,
@@ -875,7 +885,7 @@ function renderDashboard(d) {
       <div class="chart-card">
         <div class="chart-title">Rainfall by Gauge</div>
         <table class="rain-table">
-          <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th>24h</th><th>7d</th><th></th></tr></thead>
+          <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th>24h</th><th>7d</th><th>Last 24h</th></tr></thead>
           <tbody id="rain-body"></tbody>
         </table>
       </div>
@@ -902,15 +912,29 @@ function renderDashboard(d) {
     waialeale: 'Mt Waialeale',
     n_wailua: 'N. Wailua',
   };
-  // Scale the visual bar by the 24h total so the range represents a full day
-  const maxRain24 = Math.max(0.1, ...Object.values(d.rain_24h || {}));
+  // Global hourly max across all gauges, so sparkline y-axes are comparable
+  const allHourly = Object.values(d.rain_24h_series || {}).flat();
+  const maxHourly = Math.max(0.05, ...allHourly);
   for (const [key, label] of Object.entries(gaugeNames)) {
     const r1 = d.rain_1h?.[key] ?? 0;
     const r6 = d.rain_6h?.[key] ?? 0;
     const r24 = d.rain_24h?.[key] ?? 0;
     const r7d = d.rain_7d?.[key] ?? 0;
-    const pct = Math.min(100, (r24 / maxRain24) * 100);
-    const barColor = r24 > 4 ? '#ef4444' : r24 > 2 ? '#f97316' : r24 > 0.5 ? '#eab308' : '#38bdf8';
+    const hourly = (d.rain_24h_series?.[key]) || [];
+    // Build SVG sparkline: 24 hourly bars, newest on right
+    const w = 160, h = 28, pad = 1;
+    const n = 24;
+    const bw = (w - pad * (n + 1)) / n;
+    let bars = '';
+    for (let i = 0; i < n; i++) {
+      const v = hourly[i] ?? 0;
+      const bh = Math.max(1, (v / maxHourly) * (h - 2));
+      const x = pad + i * (bw + pad);
+      const y = h - bh;
+      const col = v > 0.5 ? '#ef4444' : v > 0.25 ? '#f97316' : v > 0.05 ? '#eab308' : '#38bdf8';
+      bars += `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}" fill="${col}" opacity="${v > 0 ? 1 : 0.25}"><title>h-${n-1-i}: ${v.toFixed(2)}"</title></rect>`;
+    }
+    const spark = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block">${bars}</svg>`;
     rainBody.innerHTML += `
       <tr>
         <td>${label}</td>
@@ -918,11 +942,7 @@ function renderDashboard(d) {
         <td>${r6.toFixed(2)}"</td>
         <td>${r24.toFixed(2)}"</td>
         <td>${r7d.toFixed(2)}"</td>
-        <td style="width:30%">
-          <div class="rain-bar-bg">
-            <div class="rain-bar" style="width:${pct}%; background:${barColor}"></div>
-          </div>
-        </td>
+        <td>${spark}</td>
       </tr>`;
   }
 
