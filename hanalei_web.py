@@ -235,16 +235,23 @@ def _run_prediction() -> dict:
 
     # Rain totals (compute from raw 15-min data)
     S = STEPS_PER_HOUR
-    rain_6h = {}
     rain_1h = {}
+    rain_6h = {}
+    rain_24h = {}
+    rain_7d = {}
     for name, _ in RAIN_GAUGES:
         col = _rain_col(name)
         if col in feats.columns:
-            rain_6h[name] = round(float(feats[col].iloc[-6*S:].sum()), 2)
-            rain_1h[name] = round(float(feats[col].iloc[-1*S:].sum()), 2)
+            series = feats[col]
+            rain_1h[name] = round(float(series.iloc[-1*S:].sum()), 2)
+            rain_6h[name] = round(float(series.iloc[-6*S:].sum()), 2)
+            rain_24h[name] = round(float(series.iloc[-24*S:].sum()), 2)
+            rain_7d[name] = round(float(series.iloc[-7*24*S:].sum()), 2)
         else:
-            rain_6h[name] = 0.0
             rain_1h[name] = 0.0
+            rain_6h[name] = 0.0
+            rain_24h[name] = 0.0
+            rain_7d[name] = 0.0
 
     _log("[predict] computing prob history...")
 
@@ -316,6 +323,8 @@ def _run_prediction() -> dict:
         "storm_surge_ft": round(surge_now, 2) if surge_now else None,
         "rain_1h": rain_1h,
         "rain_6h": rain_6h,
+        "rain_24h": rain_24h,
+        "rain_7d": rain_7d,
         "gauge_history": gauge_hist,
         "tide_history": tide_hist,
         "prob_history": prob_hist,
@@ -866,7 +875,7 @@ function renderDashboard(d) {
       <div class="chart-card">
         <div class="chart-title">Rainfall by Gauge</div>
         <table class="rain-table">
-          <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th></th></tr></thead>
+          <thead><tr><th>Gauge</th><th>1h</th><th>6h</th><th>24h</th><th>7d</th><th></th></tr></thead>
           <tbody id="rain-body"></tbody>
         </table>
       </div>
@@ -893,18 +902,23 @@ function renderDashboard(d) {
     waialeale: 'Mt Waialeale',
     n_wailua: 'N. Wailua',
   };
-  const maxRain6 = Math.max(0.1, ...Object.values(d.rain_6h || {}));
+  // Scale the visual bar by the 24h total so the range represents a full day
+  const maxRain24 = Math.max(0.1, ...Object.values(d.rain_24h || {}));
   for (const [key, label] of Object.entries(gaugeNames)) {
     const r1 = d.rain_1h?.[key] ?? 0;
     const r6 = d.rain_6h?.[key] ?? 0;
-    const pct = Math.min(100, (r6 / maxRain6) * 100);
-    const barColor = r6 > 1 ? '#f97316' : r6 > 0.5 ? '#eab308' : '#38bdf8';
+    const r24 = d.rain_24h?.[key] ?? 0;
+    const r7d = d.rain_7d?.[key] ?? 0;
+    const pct = Math.min(100, (r24 / maxRain24) * 100);
+    const barColor = r24 > 4 ? '#ef4444' : r24 > 2 ? '#f97316' : r24 > 0.5 ? '#eab308' : '#38bdf8';
     rainBody.innerHTML += `
       <tr>
         <td>${label}</td>
         <td>${r1.toFixed(2)}"</td>
         <td>${r6.toFixed(2)}"</td>
-        <td style="width:40%">
+        <td>${r24.toFixed(2)}"</td>
+        <td>${r7d.toFixed(2)}"</td>
+        <td style="width:30%">
           <div class="rain-bar-bg">
             <div class="rain-bar" style="width:${pct}%; background:${barColor}"></div>
           </div>
