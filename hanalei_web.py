@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Hanalei Bridge Closure Probability — Live Dashboard (v7: TFT).
+"""Hanalei Bridge Closure Probability — Live Dashboard (v9: gradient-boosted tree).
 
 A Flask web app that displays a running probability of Hanalei River bridge
-closure (gauge > 5.0 ft) within the next 3 hours, powered by the v7 TFT model.
+closure (gauge > 5.0 ft) within the next 2 hours, powered by the v9 tree model
+(sklearn HistGradientBoosting on catchment + wave features).
 
 Usage:
-    python hanalei_web.py [--model ./hanalei_v7_out] [--port 5000]
+    python hanalei_web.py [--model ./hanalei_v9_out] [--port 5000]
 """
 from __future__ import annotations
 
@@ -21,7 +22,6 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import torch
 from flask import Flask, jsonify, render_template_string
 
 print("[startup] importing hanalei_closure_model...", file=sys.stderr, flush=True)
@@ -30,31 +30,26 @@ try:
         RAIN_GAUGES,
         STEPS_PER_HOUR,
         TIMESTEP_MIN,
-        TFTBundle,
-        TFT_QUANTILES,
-        build_tft_features,
+        TreeBundle,
+        build_tree_features,
         fetch_all_rain_recent,
         fetch_bridge_gauge_recent,
         fetch_discharge_recent,
         fetch_gauge_recent,
         fetch_google_weather,
         fetch_nasa_power_precip_recent,
+        fetch_ndbc_waves_recent,
         fetch_nws_forecast,
         fetch_soil_moisture_recent,
         fetch_tide_recent,
         fetch_weather_recent,
-        load_tft_bundle,
-        prepare_tft_dataframe,
-        build_tft_dataset,
-        quantiles_to_closure_prob,
-        tft_predict_quantiles,
+        load_tree_bundle,
+        load_tree_for_prediction,
+        tree_predict_proba,
         to_hourly,
         _rain_col,
     )
-    from pytorch_forecasting import TemporalFusionTransformer
-    # Legacy alias
-    TrainBundle = TFTBundle
-    build_features = build_tft_features
+    build_features = build_tree_features
     print("[startup] import OK", file=sys.stderr, flush=True)
 except Exception as e:
     print(f"[startup] IMPORT FAILED: {e}", file=sys.stderr, flush=True)
@@ -67,8 +62,9 @@ except Exception as e:
 
 app = Flask(__name__)
 
-_bundle: TFTBundle | None = None
-_tft_model: TemporalFusionTransformer | None = None
+_bundle: TreeBundle | None = None
+_tree_model = None
+_feature_order: list = []
 _calibrator = None
 _latest: dict = {"status": "loading", "message": "Fetching initial data..."}
 _history: list[dict] = []          # last 72 hours of predictions
@@ -87,10 +83,11 @@ def _log(msg):
 
 
 def _run_prediction() -> dict:
-    """Run one prediction cycle using TFT, return result dict."""
+    """Run one prediction cycle using the tree model, return result dict."""
     bundle = _bundle
-    model = _tft_model
+    model = _tree_model
     calibrator = _calibrator
+    feature_order = _feature_order
 
     _log("[predict] fetching gauge...")
     gauge_raw = fetch_gauge_recent(hours=300)
@@ -144,12 +141,19 @@ def _run_prediction() -> dict:
         _log(f"[predict] google weather: {len(gw) if gw is not None else 0} rows")
     except Exception as e:
         _log(f"[predict] Google Weather failed: {e}")
+    waves = None
+    try:
+        _log("[predict] fetching NDBC waves...")
+        waves = fetch_ndbc_waves_recent(hours=300)
+        _log(f"[predict] waves: {len(waves) if waves is not None else 0} rows")
+    except Exception as e:
+        _log(f"[predict] NDBC waves failed: {e}")
 
     _log("[predict] building 15-min merged data...")
     merged = to_hourly(
         gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred,
         nws=nws, weather=wx, bridge_raw=bridge_raw, soil_moisture=soil,
-        sat_precip=sat_precip, google_weather=gw,
+        sat_precip=sat_precip, google_weather=gw, waves=waves,
     )
     # Trim trailing rows beyond the last actual rain observation (USGS lags 1-2h)
     last_rain_ts = None
@@ -165,66 +169,24 @@ def _run_prediction() -> dict:
 
     _log(f"[predict] merged rows: {len(merged)}, cols: {list(merged.columns)[:5]}...")
 
-    feats = build_tft_features(merged)
+    feats = build_tree_features(merged)
     feats = feats.dropna(subset=["gauge_ft"])
     _log(f"[predict] feats rows: {len(feats)}")
 
-    min_rows = bundle.encoder_length + bundle.prediction_length
+    min_rows = bundle.min_history_steps + 1
     if len(feats) < min_rows:
         _log(f"[predict] ERROR: need {min_rows} rows, only have {len(feats)}")
         return {"status": "error", "message": "Insufficient recent data from USGS/NOAA"}
 
-    # Prepare for TFT
-    prep, _ = prepare_tft_dataframe(feats, fill_medians=bundle.fill_medians)
+    _log("[predict] running tree inference...")
+    probs = tree_predict_proba(model, calibrator, feature_order, feats)
+    prep = feats
+    prob_by_tidx = {i: float(probs[i]) for i in range(len(probs))}
+    _log(f"[predict] {len(prob_by_tidx)} per-step probabilities")
 
-    # Use last N rows for prediction (keep enough for encoder + decoder)
-    max_keep = 5 * 24 * STEPS_PER_HOUR + bundle.encoder_length
-    if len(prep) > max_keep:
-        prep = prep.iloc[-max_keep:]
-        prep["time_idx"] = np.arange(len(prep))
-
-    pred_dataset = build_tft_dataset(
-        prep, encoder_length=bundle.encoder_length,
-        prediction_length=bundle.prediction_length, training=True,
-    )
-
-    _log("[predict] running TFT inference...")
-    preds = tft_predict_quantiles(model, pred_dataset)
-    if len(preds) == 0:
-        return {"status": "error", "message": "TFT produced no predictions"}
-
-    # Build a time-indexed lookup of all predictions. The TFT dataloader does
-    # NOT return predictions in chronological order, so preds[-1] is whichever
-    # batch happened to be processed last — not the latest forecast in time.
-    # We must use decoder_time_idx to map predictions to actual time positions.
-    all_probs = quantiles_to_closure_prob(preds, bundle.quantiles)
-    if calibrator:
-        all_probs = calibrator.predict(all_probs)
-    prob_by_tidx = {}
-    dl_for_idx = pred_dataset.to_dataloader(train=False, batch_size=256, num_workers=0)
-    pred_i = 0
-    for x_batch, _ in dl_for_idx:
-        dec_tidx = x_batch["decoder_time_idx"].numpy()  # (batch, pred_len)
-        enc_lens = x_batch["encoder_lengths"].numpy()   # (batch,)
-        for j in range(len(enc_lens)):
-            # "current time" = last encoder step = decoder_time_idx[j,0] - 1
-            current_tidx = int(dec_tidx[j, 0]) - 1
-            if 0 <= current_tidx < len(prep) and pred_i < len(all_probs):
-                prob_by_tidx[current_tidx] = float(all_probs[pred_i])
-            pred_i += 1
-    _log(f"[predict] mapped {len(prob_by_tidx)} predictions to time indices")
-
-    # Latest prediction = the one whose "current time" is the last row of prep.
-    # This guarantees the header value matches the last point on the chart.
+    # Latest prediction = the last row of feats (chronological order preserved).
     latest_tidx = len(prep) - 1
-    prob = prob_by_tidx.get(latest_tidx)
-    if prob is None:
-        # Fall back to the highest available time index
-        if prob_by_tidx:
-            latest_tidx = max(prob_by_tidx.keys())
-            prob = prob_by_tidx[latest_tidx]
-        else:
-            return {"status": "error", "message": "No prediction available for current time"}
+    prob = prob_by_tidx.get(latest_tidx, 0.0)
 
     gauge_now = float(feats["gauge_ft"].iloc[-1])
     already_above = bool(gauge_now >= bundle.closure_ft)
@@ -401,7 +363,7 @@ def api_debug():
             "initialized": _initialized,
             "init_error": _init_error,
             "bundle_loaded": _bundle is not None,
-            "tft_model_loaded": _tft_model is not None,
+            "tree_model_loaded": _tree_model is not None,
             "cwd": str(Path.cwd()),
             "model_exists": Path("bundle.json").exists() or Path("model.joblib").exists(),
         })
@@ -1274,50 +1236,18 @@ initialPoll();
 # ---------------------------------------------------------------------------
 
 def _init_model_and_thread(model_path: str):
-    """Load the TFT model and start the background prediction thread."""
-    global _bundle, _tft_model, _calibrator
+    """Load the gradient-boosted tree model and start the background thread."""
+    global _bundle, _tree_model, _calibrator, _feature_order
     model_dir = Path(model_path)
     if model_dir.is_file():
         model_dir = model_dir.parent
 
-    print(f"Loading TFT model from {model_dir}...", file=sys.stderr, flush=True)
+    print(f"Loading tree model from {model_dir}...", file=sys.stderr, flush=True)
 
-    # Load TFTBundle
-    bundle_path = model_dir / "bundle.json"
-    if bundle_path.exists():
-        _bundle = load_tft_bundle(bundle_path)
-    else:
-        raise FileNotFoundError(f"bundle.json not found in {model_dir}")
-
-    # Load TFT checkpoint (CPU-only: patch torch.zeros for torchmetrics CUDA device refs)
-    ckpt_path = model_dir / "tft_model_cpu.ckpt"
-    if not ckpt_path.exists():
-        ckpt_path = model_dir / "tft_model.ckpt"
-    if ckpt_path.exists():
-        _orig_zeros = torch.zeros
-        def _patched_zeros(*args, **kwargs):
-            if 'device' in kwargs and kwargs['device'] is not None:
-                dev = kwargs['device']
-                if (isinstance(dev, torch.device) and dev.type == 'cuda') or \
-                   (isinstance(dev, str) and 'cuda' in dev):
-                    kwargs['device'] = torch.device('cpu')
-            return _orig_zeros(*args, **kwargs)
-        torch.zeros = _patched_zeros
-        _tft_model = TemporalFusionTransformer.load_from_checkpoint(
-            str(ckpt_path), map_location="cpu",
-        )
-        torch.zeros = _orig_zeros
-        _tft_model.eval()
-    else:
-        raise FileNotFoundError(f"tft_model_cpu.ckpt not found in {model_dir}")
-
-    # Load calibrator
-    cal_path = model_dir / "calibrator.joblib"
-    if cal_path.exists():
-        _calibrator = joblib.load(cal_path)
+    _tree_model, _calibrator, _feature_order, _bundle = load_tree_for_prediction(model_dir)
 
     print(f"  horizon: {_bundle.horizon_h}h, threshold: {_bundle.threshold:.4f}, "
-          f"encoder: {_bundle.encoder_length}, params: {sum(p.numel() for p in _tft_model.parameters()):,}",
+          f"features: {len(_feature_order)}, calibrated: {_calibrator is not None}",
           file=sys.stderr, flush=True)
 
     t = threading.Thread(target=_prediction_loop, daemon=True)
@@ -1327,8 +1257,8 @@ def _init_model_and_thread(model_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard (v7 TFT)")
-    parser.add_argument("--model", default="./hanalei_v7_out",
+    parser = argparse.ArgumentParser(description="Hanalei Bridge Closure Dashboard (v9 tree)")
+    parser.add_argument("--model", default="./hanalei_v9_out",
                         help="Path to model directory or bundle.json")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
@@ -1347,11 +1277,11 @@ _init_error = None
 def _lazy_init():
     global _initialized, _init_error, _latest
     if not _initialized:
-        # Search for TFT model (bundle.json) or legacy model (model.joblib)
+        # Search for tree model bundle.json (root for deploy, or v9 dir locally)
         search_paths = [
             "bundle.json", "./bundle.json",
-            "hanalei_v7_out/bundle.json", "./hanalei_v7_out/bundle.json",
-            "hanalei_v7_out", "./hanalei_v7_out",
+            "hanalei_v9_out/bundle.json", "./hanalei_v9_out/bundle.json",
+            "hanalei_v9_out", "./hanalei_v9_out",
         ]
         for _p in search_paths:
             if Path(_p).exists():
@@ -1360,7 +1290,7 @@ def _lazy_init():
                     _init_model_and_thread(_p)
                     _initialized = True
                     _init_error = None
-                    _log("[init] SUCCESS — TFT model loaded, background thread started")
+                    _log("[init] SUCCESS — tree model loaded, background thread started")
                 except Exception as e:
                     _init_error = traceback.format_exc()
                     _log(f"[init] FAILED: {e}")
@@ -1371,7 +1301,7 @@ def _lazy_init():
                 return
         _log("[init] ERROR: bundle.json not found!")
         _init_error = "bundle.json not found"
-        _latest = {"status": "error", "message": "TFT model (bundle.json) not found"}
+        _latest = {"status": "error", "message": "Tree model (bundle.json) not found"}
         _initialized = True
 
 if __name__ == "__main__":

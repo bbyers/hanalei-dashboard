@@ -42,15 +42,27 @@ from sklearn.metrics import (
     roc_curve,
 )
 
-import torch
-import lightning.pytorch as pl
-from pytorch_forecasting import (
-    TemporalFusionTransformer,
-    TimeSeriesDataSet,
-    QuantileLoss,
-)
-from pytorch_forecasting.data import NaNLabelEncoder
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+# Torch / TFT stack is only needed for TFT *training* (run locally). The
+# deployed dashboard uses the gradient-boosted tree and has no torch installed,
+# so import lazily: the module must import cleanly without the torch stack.
+try:
+    import torch
+    import lightning.pytorch as pl
+    from pytorch_forecasting import (
+        TemporalFusionTransformer,
+        TimeSeriesDataSet,
+        QuantileLoss,
+    )
+    from pytorch_forecasting.data import NaNLabelEncoder
+    from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    pl = None
+    TemporalFusionTransformer = TimeSeriesDataSet = QuantileLoss = None
+    NaNLabelEncoder = None
+    EarlyStopping = LearningRateMonitor = None
+    _TORCH_AVAILABLE = False
 
 # --- constants -------------------------------------------------------------
 
@@ -79,6 +91,43 @@ RAIN_GAUGES: list[tuple[str, str]] = [
     ("n_wailua",    "220356159281401"),
 ]
 
+# Per-gauge metadata (authoritative coords/elev from USGS site service).
+# basin classification relative to the Hanalei River catchment (21.0 mi² above the
+# Hwy 56 bridge): only Mt Waialeale sits on the headwater divide; N Wailua is on
+# the SE edge; the other four are 9-14 km WEST, in the Waimea River drainage, and
+# act as correlated regional proxies (same storm systems) rather than in-basin rain.
+# map_weight = contribution to the elevation-weighted catchment mean-areal-precip.
+GAUGE_META: dict[str, dict] = {
+    "waialeale":   {"lat": 22.0709, "lon": -159.4980, "elev_ft": 5150, "basin": "hanalei", "map_weight": 1.0},
+    "n_wailua":    {"lat": 22.0625, "lon": -159.4677, "elev_ft": 1110, "basin": "edge",    "map_weight": 0.4},
+    "kilohana":    {"lat": 22.1541, "lon": -159.5946, "elev_ft": 4000, "basin": "waimea",  "map_weight": 0.0},
+    "waialae":     {"lat": 22.0870, "lon": -159.5664, "elev_ft": 4000, "basin": "waimea",  "map_weight": 0.0},
+    "mohihi_crsg": {"lat": 22.1171, "lon": -159.6010, "elev_ft": 3420, "basin": "waimea",  "map_weight": 0.0},
+    "waiakoali":   {"lat": 22.1245, "lon": -159.6221, "elev_ft": 3420, "basin": "waimea",  "map_weight": 0.0},
+}
+# Gauge groupings for catchment-aware aggregates.
+INBASIN_GAUGES = [n for n, m in GAUGE_META.items() if m["basin"] in ("hanalei", "edge")]
+REGIONAL_GAUGES = [n for n, m in GAUGE_META.items() if m["basin"] == "waimea"]
+
+# Catchment characteristics above the Hwy 56 bridge (USGS site 16104200).
+BASIN_AREA_MI2 = 21.0
+UPSTREAM_AREA_MI2 = 18.51   # site 16103000 captures 88% of the bridge drainage
+
+# Climatological Flash Flood Guidance (inches of rain over the window that would
+# cause flooding) for the Hanalei catchment. These are approximate STATIC thresholds
+# — live county FFG has no 18-yr archive to train on, so we use a fixed reference
+# and let the model learn from the (recent_rain / FFG) ratio.
+FFG_THRESHOLDS_IN: dict[int, float] = {1: 2.0, 3: 3.0, 6: 4.0}
+
+# NDBC wave buoy in Hanalei Bay (Station 51208, deployed ~2009). Breaking-wave
+# setup at the shallow river mouth raises the bridge-gauge reading during big swells.
+NDBC_STATION = "51208"
+NDBC_REALTIME_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
+NDBC_HISTORICAL_URL = (
+    "https://www.ndbc.noaa.gov/view_text_file.php?"
+    "filename={station}h{year}.txt.gz&dir=data/historical/stdmet/"
+)
+
 # NWS API forecast gridpoint for Hanalei, Kauai
 NWS_GRIDPOINT = "HFO/87,185"
 NWS_API_URL = f"https://api.weather.gov/gridpoints/{NWS_GRIDPOINT}"
@@ -90,7 +139,7 @@ GOOGLE_WEATHER_API_KEY = os.environ.get("GOOGLE_WEATHER_API_KEY", "")
 
 # --- TFT hyperparameters ---
 TFT_ENCODER_LENGTH = 96       # 24 hours of lookback at 15-min
-TFT_PREDICTION_LENGTH = 12    # 3 hours of forecast at 15-min
+TFT_PREDICTION_LENGTH = 8     # 2 hours of forecast at 15-min (v8)
 TFT_HIDDEN_SIZE = 64
 TFT_ATTENTION_HEADS = 4
 TFT_DROPOUT = 0.1
@@ -117,10 +166,10 @@ CATCHMENT_POINTS = {
 }
 
 CLOSURE_FT = 5.0
-HORIZON_H = 3
+HORIZON_H = 2               # predict closure within the next 2 hours (v8)
 TIMESTEP_MIN = 15           # 15-minute resolution (v6)
 STEPS_PER_HOUR = 60 // TIMESTEP_MIN  # 4
-HORIZON_STEPS = HORIZON_H * STEPS_PER_HOUR  # 12
+HORIZON_STEPS = HORIZON_H * STEPS_PER_HOUR  # 8
 
 # Rolling rain windows in HOURS — will be converted to steps internally.
 RAIN_WINDOWS_PER_GAUGE = (1, 3, 6, 24)
@@ -150,6 +199,20 @@ TFT_OBSERVED_COLS = [
     "soil_moisture_deep",
     "sat_precip_mm",
     "rain_ema_168h",   # 7-day antecedent rain EMA (captures saturation beyond lookback)
+    # ---- v8 catchment-aware features ----
+    "rain_inbasin_map",   # mean areal precip over in-basin gauges (weighted)
+    "rain_regional",      # regional (out-of-basin Waimea) rain — synoptic context
+    "map_rain_1h", "map_rain_3h", "map_rain_6h", "map_rain_24h",  # MAP accumulations
+    "api_24h", "api_72h",         # antecedent precipitation index (saturation)
+    "runoff_scs_6h",              # SCS curve-number direct runoff (6h)
+    "curve_number",               # dynamic curve number (wetness proxy)
+    "rain_uh_response",           # basin unit-hydrograph convolved rainfall
+    "ffg_ratio_1h", "ffg_ratio_3h", "ffg_ratio_6h",  # flash-flood-guidance ratios
+    "gauge_dt_30m", "gauge_dt_1h", "gauge_accel",     # stage rise rate / acceleration
+    "bridge_dt_30m", "bridge_dt_1h",                  # bridge-gauge rise rate
+    "q_dt_1h",                    # discharge rate of change
+    "wave_hs_m", "wave_period_s", "wave_dir_deg",     # NDBC 51208 wave state
+    "wave_runup_proxy",           # sqrt(Hs)*period — mouth backwater proxy
 ]
 
 # Time-varying KNOWN: available for future/decoder window
@@ -553,6 +616,108 @@ def fetch_nasa_power_precip_recent(days: int = 14) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# --- NDBC wave buoy (Hanalei Bay, Station 51208) ---------------------------
+
+def _parse_ndbc_text(text: str) -> pd.DataFrame:
+    """Parse NDBC standard-met text (realtime2 or historical) into wave columns.
+
+    Returns wave_hs_m (significant wave height), wave_period_s (dominant period),
+    wave_dir_deg (mean wave direction), indexed by UTC ts. Handles the column-order
+    and minute-column variations across NDBC's historical archive (2009+).
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    header = None
+    data_lines = []
+    for ln in lines:
+        if ln.startswith("#"):
+            if header is None:
+                header = ln.lstrip("#").split()
+            continue
+        data_lines.append(ln.split())
+    if header is None or not data_lines:
+        return pd.DataFrame()
+
+    idx = {name: i for i, name in enumerate(header)}
+    has_min = "mm" in idx
+
+    def num(row, name):
+        i = idx.get(name)
+        if i is None or i >= len(row):
+            return np.nan
+        try:
+            f = float(row[i])
+        except ValueError:
+            return np.nan
+        # NDBC pads missing values with 9s (99.0 / 999 / 9999.0 by column width).
+        if f in (99.0, 999.0, 9999.0) or f >= 999.0:
+            return np.nan
+        return f
+
+    recs = []
+    for row in data_lines:
+        try:
+            yr = int(row[idx["YY"]]); mo = int(row[idx["MM"]])
+            dy = int(row[idx["DD"]]); hr = int(row[idx["hh"]])
+            mn = int(row[idx["mm"]]) if has_min else 0
+        except (KeyError, ValueError, IndexError):
+            continue
+        if yr < 100:
+            yr += 1900 if yr > 70 else 2000
+        try:
+            ts = pd.Timestamp(year=yr, month=mo, day=dy, hour=hr, minute=mn, tz="UTC")
+        except ValueError:
+            continue
+        recs.append((ts, num(row, "WVHT"), num(row, "DPD"), num(row, "MWD")))
+    if not recs:
+        return pd.DataFrame()
+    df = (
+        pd.DataFrame(recs, columns=["ts", "wave_hs_m", "wave_period_s", "wave_dir_deg"])
+        .set_index("ts").sort_index()
+    )
+    return df[~df.index.duplicated(keep="last")]
+
+
+def fetch_ndbc_waves(start: datetime, end: datetime) -> pd.DataFrame:
+    """Fetch NDBC 51208 (Hanalei Bay) wave history via per-year gzip files (~2009+)."""
+    frames = []
+    for year in range(start.year, end.year + 1):
+        url = NDBC_HISTORICAL_URL.format(station=NDBC_STATION, year=year)
+        try:
+            r = requests.get(url, timeout=120)
+            if r.status_code != 200 or not r.text or "Unable to locate" in r.text[:300]:
+                print(f"  ndbc/{year}      no data", file=sys.stderr)
+                continue
+            df = _parse_ndbc_text(r.text)
+            if not df.empty:
+                frames.append(df)
+                print(f"  ndbc/{year}      {len(df):,} rows", file=sys.stderr)
+        except requests.exceptions.RequestException as e:
+            print(f"  ndbc/{year}      FAILED: {e}", file=sys.stderr)
+        time.sleep(0.3)
+    if not frames:
+        return pd.DataFrame(columns=["wave_hs_m", "wave_period_s", "wave_dir_deg"]).set_index(
+            pd.DatetimeIndex([], tz="UTC", name="ts")
+        )
+    df = pd.concat(frames).sort_index()
+    return df[(df.index >= start) & (df.index <= end)]
+
+
+def fetch_ndbc_waves_recent(hours: int = 300) -> pd.DataFrame:
+    """Fetch recent NDBC 51208 wave data from the realtime2 feed (last ~45 days)."""
+    url = NDBC_REALTIME_URL.format(station=NDBC_STATION)
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        df = _parse_ndbc_text(r.text)
+        if df.empty:
+            return df
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        return df[df.index >= cutoff]
+    except Exception as e:
+        print(f"  ndbc/recent    FAILED: {e}", file=sys.stderr)
+        return pd.DataFrame()
+
+
 # --- NWS forecast data -----------------------------------------------------
 
 def _parse_nws_timeseries(values: list[dict], col_name: str) -> pd.DataFrame:
@@ -757,6 +922,7 @@ def to_hourly(
     soil_moisture: pd.DataFrame | None = None,
     sat_precip: pd.DataFrame | None = None,
     google_weather: pd.DataFrame | None = None,
+    waves: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Resample all sources to aligned 15-minute records (v7).
 
@@ -815,6 +981,12 @@ def to_hourly(
         for col in gw_15.columns:
             frames.append(gw_15[col])
 
+    # NDBC wave buoy (~30-min) — interpolate to 15-min (v8)
+    if waves is not None and not waves.empty:
+        wv_15 = waves.resample(freq).mean()
+        for col in wv_15.columns:
+            frames.append(wv_15[col])
+
     df = pd.concat(frames, axis=1, sort=True)
 
     # Satellite precip: daily → spread to 15-min by forward-filling (v6)
@@ -840,6 +1012,10 @@ def to_hourly(
     for sm_col in ["soil_moisture_shallow", "soil_moisture_mid", "soil_moisture_deep"]:
         if sm_col in df.columns:
             df[sm_col] = df[sm_col].interpolate(method="time", limit=12 * STEPS_PER_HOUR)
+    # Waves: interpolate across the ~30-min reporting cadence (gaps left as NaN)
+    for wv_col in ["wave_hs_m", "wave_period_s", "wave_dir_deg"]:
+        if wv_col in df.columns:
+            df[wv_col] = df[wv_col].interpolate(method="time", limit=6 * STEPS_PER_HOUR)
 
     df = df.dropna(subset=["gauge_ft"])
     return df
@@ -873,6 +1049,71 @@ def build_tft_features(df: pd.DataFrame) -> pd.DataFrame:
         out[_rain_col(name)].fillna(0) for name, _ in RAIN_GAUGES
     )
     out["rain_ema_168h"] = total_rain.ewm(halflife=168 * S, min_periods=1).mean()
+
+    # ===================== catchment-aware features (v8) =====================
+    # Only Mt Waialeale (headwater) + N Wailua (edge) lie in/on the 21 mi² Hanalei
+    # catchment; the four Waimea-side gauges are correlated regional proxies. We build
+    # an elevation/area-weighted catchment mean-areal-precip (MAP) as a no-auth proxy
+    # for "clip gridded precip to the basin polygon".
+    map_num, map_den = None, 0.0
+    for name in INBASIN_GAUGES:
+        col = _rain_col(name)
+        if col in out.columns:
+            w = GAUGE_META[name]["map_weight"]
+            term = out[col].fillna(0.0) * w
+            map_num = term if map_num is None else (map_num + term)
+            map_den += w
+    out["rain_inbasin_map"] = (map_num / map_den) if (map_num is not None and map_den) else 0.0
+    inbasin = out["rain_inbasin_map"]
+
+    reg_cols = [_rain_col(n) for n in REGIONAL_GAUGES if _rain_col(n) in out.columns]
+    out["rain_regional"] = out[reg_cols].fillna(0.0).mean(axis=1) if reg_cols else 0.0
+
+    # Catchment rainfall accumulations (inches over window)
+    for h in (1, 3, 6, 24):
+        out[f"map_rain_{h}h"] = inbasin.rolling(h * S, min_periods=1).sum()
+
+    # Antecedent Precipitation Index (EMA of catchment rain) — soil-saturation proxy
+    out["api_24h"] = inbasin.ewm(halflife=24 * S, min_periods=1).mean()
+    out["api_72h"] = inbasin.ewm(halflife=72 * S, min_periods=1).mean()
+
+    # SCS Curve-Number runoff with antecedent-moisture-dependent CN (steep tropical forest)
+    rain72 = inbasin.rolling(72 * S, min_periods=1).sum()
+    wet = (rain72 / 4.0).clip(0, 1)             # 0 (dry) .. 1 (saturated)
+    cn = 60.0 + 35.0 * wet                      # CN ~60..95
+    s_ret = 1000.0 / cn - 10.0                  # potential retention (in)
+    ia = 0.2 * s_ret                            # initial abstraction (in)
+    p6 = out["map_rain_6h"]
+    excess = (p6 - ia).clip(lower=0.0)
+    out["runoff_scs_6h"] = excess**2 / (p6 - ia + s_ret)
+    out["curve_number"] = cn
+
+    # Basin-lag unit-hydrograph response (triangular kernel, peak ~1h, base ~3h)
+    tri_len, peak = 3 * S, 1 * S
+    k = np.concatenate([np.linspace(0, 1, peak, endpoint=False),
+                        np.linspace(1, 0, tri_len - peak)])
+    k = k / k.sum()
+    out["rain_uh_response"] = np.convolve(inbasin.fillna(0.0).values, k, mode="full")[:len(out)]
+
+    # Flash Flood Guidance ratios (recent catchment rain / climatological FFG threshold)
+    for h, thresh in FFG_THRESHOLDS_IN.items():
+        out[f"ffg_ratio_{h}h"] = out[f"map_rain_{h}h"] / thresh
+
+    # Stage / discharge dynamics (rate of rise + acceleration) — key for a 2-h horizon
+    def _deriv(col, steps):
+        return (out[col] - out[col].shift(steps)) if col in out.columns else pd.Series(np.nan, index=out.index)
+    out["gauge_dt_30m"] = _deriv("gauge_ft", S // 2)
+    out["gauge_dt_1h"] = _deriv("gauge_ft", S)
+    out["gauge_accel"] = out["gauge_dt_30m"] - out["gauge_dt_30m"].shift(S // 2)
+    out["bridge_dt_30m"] = _deriv("bridge_ft", S // 2)
+    out["bridge_dt_1h"] = _deriv("bridge_ft", S)
+    out["q_dt_1h"] = _deriv("q_cfs", S)
+
+    # Wave runup proxy at the river mouth (deep-water): ~ sqrt(Hs) * Tp
+    if "wave_hs_m" in out.columns and "wave_period_s" in out.columns:
+        out["wave_runup_proxy"] = np.sqrt(out["wave_hs_m"].clip(lower=0)) * out["wave_period_s"]
+    else:
+        out["wave_runup_proxy"] = np.nan
 
     # --- NWS forecast QPF forward sums ---
     if "qpf_mm" in out.columns:
@@ -930,6 +1171,52 @@ def build_target(df: pd.DataFrame) -> pd.Series:
     return y
 
 
+# --- v9 tree model: feature engineering -------------------------------------
+# A gradient-boosted tree has no temporal memory, so we give it explicit lag and
+# rolling context. build_tree_features() is shared by training and serving to
+# guarantee train/serve parity.
+
+TREE_LAG_PLAN = {
+    "gauge_ft":         [1, 2, 4, 8, 12, 24, 48],   # up to 12h back (15-min steps)
+    "q_cfs":            [1, 4, 8, 24],
+    "rain_inbasin_map": [1, 4, 8, 24],
+    "rain_regional":    [4, 24],
+    "api_24h":          [4, 24],
+    "bridge_ft":        [1, 4, 8],
+    "tide_ft":          [4],
+}
+
+
+def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add lag + rolling features capturing recent trajectory for the tree."""
+    out = df.copy()
+    s = STEPS_PER_HOUR
+    for col, lags in TREE_LAG_PLAN.items():
+        if col in out.columns:
+            for L in lags:
+                out[f"{col}_lag{L}"] = out[col].shift(L)
+    if "gauge_ft" in out.columns:
+        g = out["gauge_ft"]
+        out["gauge_max_1h"] = g.rolling(1 * s, min_periods=1).max()
+        out["gauge_max_3h"] = g.rolling(3 * s, min_periods=1).max()
+        out["gauge_min_3h"] = g.rolling(3 * s, min_periods=1).min()
+        out["gauge_std_3h"] = g.rolling(3 * s, min_periods=2).std()
+    return out
+
+
+def build_tree_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """Full tree feature frame = catchment/wave features + lag/rolling context.
+
+    inf -> NaN so HistGradientBoosting (which handles NaN natively but not inf)
+    is safe. Causal: every feature uses only data at or before time t.
+    """
+    feats = build_tft_features(raw)
+    feats = add_lag_features(feats)
+    num = feats.select_dtypes(include=[np.number]).columns
+    feats[num] = feats[num].replace([np.inf, -np.inf], np.nan)
+    return feats
+
+
 # --- TFT model infrastructure -----------------------------------------------
 
 @dataclass
@@ -963,6 +1250,56 @@ def load_tft_bundle(path: Path) -> TFTBundle:
 
 # Legacy alias so web module can load either
 TrainBundle = TFTBundle
+
+
+@dataclass
+class TreeBundle:
+    """Serializable metadata for the v9 gradient-boosted tree model."""
+    threshold: float
+    feature_order: list = field(default_factory=list)
+    model_type: str = "tree"
+    closure_ft: float = CLOSURE_FT
+    horizon_h: int = HORIZON_H
+    horizon_steps: int = HORIZON_STEPS
+    min_history_steps: int = 48          # longest lag used by add_lag_features
+    rain_gauge_names: list = field(default_factory=lambda: [n for n, _ in RAIN_GAUGES])
+
+
+def save_tree_bundle(bundle: "TreeBundle", out_dir: Path) -> None:
+    (out_dir / "bundle.json").write_text(json.dumps(asdict(bundle), indent=2, default=str))
+
+
+def load_tree_bundle(path: Path) -> "TreeBundle":
+    if path.is_dir():
+        path = path / "bundle.json"
+    return TreeBundle(**json.loads(path.read_text()))
+
+
+def load_tree_for_prediction(model_dir: Path):
+    """Load the v9 tree model, calibrator, and bundle for prediction."""
+    model_dir = Path(model_dir)
+    model = joblib.load(model_dir / "model.joblib")
+    cal_path = model_dir / "calibrator.joblib"
+    calibrator = joblib.load(cal_path) if cal_path.exists() else None
+    bundle = load_tree_bundle(model_dir / "bundle.json")
+    feat_order = bundle.feature_order
+    if not feat_order:
+        fp = model_dir / "feature_order.json"
+        feat_order = json.loads(fp.read_text()) if fp.exists() else []
+    return model, calibrator, feat_order, bundle
+
+
+def tree_predict_proba(model, calibrator, feature_order, feats: pd.DataFrame) -> np.ndarray:
+    """Calibrated P(closure within horizon) for every row of `feats`.
+
+    Reindexes to the trained feature order (missing cols -> NaN, which
+    HistGradientBoosting handles), then applies isotonic calibration.
+    """
+    X = feats.reindex(columns=feature_order).to_numpy("float32")
+    raw = model.predict_proba(X)[:, 1]
+    if calibrator is not None:
+        return np.asarray(calibrator.transform(raw), dtype=float)
+    return raw.astype(float)
 
 
 def date_split(df: pd.DataFrame, test_years: float, val_years: float):
@@ -1102,9 +1439,18 @@ def fetch_all_training_data(end: datetime) -> pd.DataFrame:
         print(f"  satellite precip FAILED: {e}", file=sys.stderr)
         sat_precip = None
 
+    print(f"Fetching NDBC {NDBC_STATION} wave data {start.date()} -> {end.date()}", file=sys.stderr)
+    try:
+        waves = fetch_ndbc_waves(start, end)
+        print(f"  wave rows: {len(waves):,}", file=sys.stderr)
+    except Exception as e:
+        print(f"  wave data FAILED: {e}", file=sys.stderr)
+        waves = None
+
     hourly = to_hourly(
         gauge_raw, rain_raw, q_raw=q_raw, tide_obs=tide_obs, tide_pred=tide_pred,
         weather=wx, bridge_raw=bridge_raw, soil_moisture=soil, sat_precip=sat_precip,
+        waves=waves,
     )
     print(f"Merged hourly rows: {len(hourly):,}", file=sys.stderr)
     return hourly
@@ -1373,7 +1719,11 @@ def train_tft(
         else:
             print("WARNING: No checkpoint found, returning last model state", file=sys.stderr)
             best_tft = tft
+            best_path = ""
 
+    # Stash the resolved best-checkpoint path so train_cmd can copy it without
+    # touching `.trainer` (the reloaded model is detached from any Trainer).
+    best_tft._best_ckpt_path = best_path
     return best_tft
 
 
@@ -1402,6 +1752,44 @@ def tft_predict_quantiles(
 
 
 # --- training command -------------------------------------------------------
+
+def _aligned_eval(model, dataset, prep_df, quantiles, batch_size=256):
+    """Map each TFT prediction to its true time position via decoder_time_idx.
+
+    The TFT dataloader does NOT emit predictions in row order, and a dataset
+    built with training=True can yield a different sample count than len(df)
+    (variable encoder length). Aligning by `iloc[-n:]` is therefore fragile and
+    can mis-pair (or crash on) labels. Instead we key every prediction by its
+    current step = decoder_time_idx[j,0]-1 (an index into prep_df), dedupe, and
+    join to the target built on the same frame.
+
+    Returns (probs_raw, y_true, row_positions) sorted by time. probs_raw is the
+    UNcalibrated closure probability; apply the calibrator downstream.
+    """
+    preds = tft_predict_quantiles(model, dataset, batch_size=batch_size)
+    probs = quantiles_to_closure_prob(preds, quantiles)
+    y_full = build_target(prep_df).values  # positional, aligned to prep_df rows
+
+    dl = dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+    prob_by_tidx: dict[int, float] = {}
+    i = 0
+    for x_batch, _ in dl:
+        dec_tidx = x_batch["decoder_time_idx"].numpy()
+        for j in range(dec_tidx.shape[0]):
+            if i >= len(probs):
+                break
+            cur = int(dec_tidx[j, 0]) - 1
+            prob_by_tidx[cur] = float(probs[i])
+            i += 1
+
+    rows = sorted(
+        t for t in prob_by_tidx
+        if 0 <= t < len(y_full) and not pd.isna(y_full[t])
+    )
+    out_p = np.array([prob_by_tidx[t] for t in rows], dtype=float)
+    out_y = np.array([int(y_full[t]) for t in rows], dtype=int)
+    return out_p, out_y, rows
+
 
 def train_cmd(args):
     out_dir = Path(args.out_dir)
@@ -1486,31 +1874,29 @@ def train_cmd(args):
         pretensorize=getattr(args, 'pretensorize', False),
     )
 
-    # Save TFT checkpoint to known location
+    # Save TFT checkpoint to known location. train_tft stashes the best
+    # checkpoint path on the model (the reloaded model has no `.trainer`).
     ckpt_path = out_dir / "tft_model.ckpt"
-    trainer_ckpt = tft_model.trainer.checkpoint_callback.best_model_path if hasattr(tft_model, 'trainer') else None
+    trainer_ckpt = getattr(tft_model, "_best_ckpt_path", None)
     if trainer_ckpt and Path(trainer_ckpt).exists():
         import shutil
         shutil.copy2(trainer_ckpt, ckpt_path)
     else:
+        # Fallback only saves weights; not loadable via load_from_checkpoint.
+        print("WARNING: no best checkpoint path; saving state_dict fallback "
+              "(prediction reload may fail).", file=sys.stderr)
         torch.save(tft_model.state_dict(), ckpt_path)
     print(f"Saved TFT checkpoint to {ckpt_path}", file=sys.stderr)
 
     # --- Generate closure probabilities on val & test for calibration/eval ---
     quantiles = TFT_QUANTILES
 
-    # Validation predictions
-    val_preds = tft_predict_quantiles(tft_model, val_dataset, batch_size=batch_size)
-    val_probs = quantiles_to_closure_prob(val_preds, quantiles)
-
-    # Build target for val (need to align with dataset output indices)
-    val_y = build_target(val_df)
-    # The dataset drops early rows (need encoder_length history), align indices
-    n_val_preds = len(val_probs)
-    val_y_aligned = val_y.iloc[-n_val_preds:].values
-    valid_mask = ~pd.isna(val_y_aligned)
-    val_y_clean = val_y_aligned[valid_mask].astype(int)
-    val_probs_clean = val_probs[valid_mask]
+    # Validation predictions — align via decoder_time_idx (robust to sample count)
+    val_probs_clean, val_y_clean, val_rows = _aligned_eval(
+        tft_model, val_dataset, val_prep, quantiles, batch_size=batch_size,
+    )
+    print(f"val aligned: {len(val_probs_clean):,} preds, "
+          f"{int(val_y_clean.sum())} positive", file=sys.stderr)
 
     # Isotonic calibration
     print("Fitting isotonic calibrator on validation set...", file=sys.stderr)
@@ -1525,7 +1911,7 @@ def train_cmd(args):
         threshold = 0.5
     elif args.objective == "event_recall":
         # Create a mini DataFrame for event_recall tuning
-        val_for_tune = val_df.iloc[-n_val_preds:][valid_mask].copy()
+        val_for_tune = val_prep.iloc[val_rows].copy()
         val_for_tune["y"] = val_y_clean
         threshold = tune_threshold_event_recall(
             val_for_tune, val_probs_clean, min_precision=args.min_precision,
@@ -1539,15 +1925,11 @@ def train_cmd(args):
         test_prep, encoder_length=encoder_length,
         prediction_length=prediction_length, training=True,
     )
-    test_preds = tft_predict_quantiles(tft_model, test_dataset, batch_size=batch_size)
-    test_probs = quantiles_to_closure_prob(test_preds, quantiles)
-
-    test_y = build_target(test_df)
-    n_test_preds = len(test_probs)
-    test_y_aligned = test_y.iloc[-n_test_preds:].values
-    test_valid = ~pd.isna(test_y_aligned)
-    y_test = test_y_aligned[test_valid].astype(int)
-    test_probs_clean = test_probs[test_valid]
+    test_probs_clean, y_test, test_rows = _aligned_eval(
+        tft_model, test_dataset, test_prep, quantiles, batch_size=batch_size,
+    )
+    print(f"test aligned: {len(test_probs_clean):,} preds, "
+          f"{int(y_test.sum())} positive", file=sys.stderr)
 
     # Calibrate test probabilities
     test_probs_cal = calibrator.predict(test_probs_clean)
@@ -1555,7 +1937,7 @@ def train_cmd(args):
 
     # Metrics
     metrics = {
-        "model": "TFT_v7",
+        "model": "TFT_v8",
         "roc_auc": float(roc_auc_score(y_test, test_probs_cal)) if y_test.sum() > 0 else None,
         "pr_auc": float(average_precision_score(y_test, test_probs_cal)) if y_test.sum() > 0 else None,
         "threshold": threshold,
@@ -1565,7 +1947,7 @@ def train_cmd(args):
         "n_val": int(len(val_df)),
         "n_test": int(len(test_df)),
     }
-    test_df_for_metrics = test_df.iloc[-n_test_preds:][test_valid].copy()
+    test_df_for_metrics = test_prep.iloc[test_rows].copy()
     test_df_for_metrics["y"] = y_test
     metrics.update({f"event_{k}": v for k, v in event_metrics(
         test_df_for_metrics, test_probs_cal, threshold).items()})
@@ -1613,7 +1995,7 @@ def train_cmd(args):
         plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR (test) — TFT v7"); plt.legend()
         plt.tight_layout(); plt.savefig(out_dir / "pr.png", dpi=120); plt.close()
 
-    test_df_plot = test_df.iloc[-n_test_preds:][test_valid]
+    test_df_plot = test_prep.iloc[test_rows]
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(test_df_plot.index, test_df_plot["gauge_ft"], lw=0.8, label="gauge_ft")
     ax.axhline(CLOSURE_FT, color="red", ls="--", alpha=0.5, label="5 ft closure")
